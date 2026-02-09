@@ -22,7 +22,7 @@ from ..utils.params import (
     extract_chat_params_from_responses,
     normalize_messages_from_input,
 )
-from .schemas import ChatCompletionsRequest, ResponsesRequest
+from .schemas import ChatCompletionsRequest, CompletionsRequest, ResponsesRequest
 from ..services.openai_service import (
     create_client,
     create_chat_completion,
@@ -153,6 +153,101 @@ def register_routes(app, settings):
     @app.route('/', methods=['GET'])
     def index():
         return render_template("index.html")
+
+    @app.route('/completions', methods=['POST'])
+    @app.route('/v1/completions', methods=['POST'])
+    def completions():
+        try:
+            data = request.get_json(silent=True) or {}
+            if "model" not in data and "modelId" in data:
+                data["model"] = data["modelId"]
+            try:
+                payload = CompletionsRequest.model_validate(data)
+            except ValidationError as e:
+                return error_response(str(e), 400, "invalid_request_error")
+            payload_dict = payload.model_dump(exclude_none=True)
+            prompt = payload.prompt
+            if prompt is None:
+                return error_response("No prompt provided", 400, "invalid_request_error")
+            if isinstance(prompt, list):
+                prompt_text = "\n".join(str(item) for item in prompt if item is not None)
+            elif isinstance(prompt, str):
+                prompt_text = prompt
+            else:
+                return error_response("Invalid prompt", 400, "invalid_request_error")
+            resolved, error_message = _resolve_request_model(payload_dict)
+            if error_message:
+                return error_response(error_message, 400)
+            params = extract_chat_params(payload_dict)
+            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
+
+            if payload.stream:
+                return error_response(
+                    "Streaming not supported for /v1/completions; use /v1/chat/completions",
+                    400,
+                    "invalid_request_error",
+                )
+
+            log_cfg = get_logging_config()
+            upstream_payload = redact_payload(
+                {
+                    "model": resolved["model"],
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    **params,
+                },
+                log_cfg.get("redact_keys", []),
+            )
+            if log_cfg.get("include_body"):
+                try:
+                    log_event(
+                        20,
+                        "upstream_request",
+                        request_id=g.request_id,
+                        provider=resolved.get("provider_name") or resolved.get("base_url"),
+                        upstream_url=g.upstream_url,
+                        payload=upstream_payload,
+                    )
+                except Exception as e:
+                    log_event(40, "upstream_log_failed", error=str(e))
+
+            client = _build_client(settings, resolved["base_url"], resolved["api_key"])
+            try:
+                content = create_chat_completion(
+                    client,
+                    resolved["model"],
+                    [{"role": "user", "content": prompt_text}],
+                    **params,
+                )
+            except openai.RateLimitError as e:
+                return error_response(str(e), 429, "rate_limit_error")
+            except openai.APIConnectionError as e:
+                return error_response(str(e), 502, "api_connection_error")
+            except openai.APIStatusError as e:
+                _log_upstream_error(e, g.request_id, g.upstream_url, payload=upstream_payload)
+                status = getattr(e, "status_code", 502) or 502
+                return error_response(str(e), status, "api_error")
+            except Exception as e:
+                return error_response(str(e), 500, "internal_error")
+
+            return jsonify(
+                {
+                    "id": _make_response_id("cmpl"),
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": resolved["id"],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "text": content,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            )
+
+        except Exception as e:
+            log_event(40, "completions_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/chat/completions', methods=['POST'])
     @app.route('/v1/chat/completions', methods=['POST'])

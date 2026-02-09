@@ -55,6 +55,16 @@ class ChatCompletionsRequest(BaseModel):
         extra = "allow"
 
 
+class CompletionsRequest(BaseModel):
+    model: Optional[str] = None
+    prompt: Optional[Union[str, List[str]]] = None
+    stream: bool = False
+
+    class Config:
+        # Allow forward-compat fields from clients; we ignore unsupported ones.
+        extra = "allow"
+
+
 class ResponsesRequest(BaseModel):
     model: Optional[str] = None
     input: Optional[Union[str, List[Any]]] = None
