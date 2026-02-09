@@ -57,19 +57,34 @@ flowchart LR
 
 ## 接口流程图（详细）
 ```mermaid
-flowchart TD
-  Client[客户端/API 面板] -->|GET /v1/models| Proxy[AIProxy]
+%%{init: {'flowchart': {'nodeSpacing': 40, 'rankSpacing': 50}}}%%
+flowchart LR
+  subgraph Inbound[请求进入]
+    Client[客户端/API 面板]
+    Proxy[AIProxy]
+  end
+
+  subgraph AuthFlow[鉴权与路由]
+    Auth{Key 合法?}
+    Reject[返回 401]
+    Route[解析 model 别名]
+    Config[读取 config.json]
+    Map[映射为上游模型]
+    Rewrite[改写 model 并转发]
+  end
+
+  subgraph Upstream[上游调用]
+    Provider[上游供应商 API]
+  end
+
+  Client -->|GET /v1/models| Proxy
   Client -->|POST /v1/chat/completions| Proxy
   Client -->|POST /v1/responses| Proxy
 
-  Proxy -->|校验 access_keys| Auth{Key 合法?}
-  Auth -- 否 --> Reject[返回 401]
-  Auth -- 是 --> Route[解析 model 别名]
-
-  Route --> Config[读取 config.json]
-  Config --> Map[映射为上游模型]
-  Map --> Rewrite[改写 model 并转发]
-  Rewrite --> Provider[上游供应商 API]
+  Proxy -->|校验 access_keys| Auth
+  Auth -- 否 --> Reject
+  Auth -- 是 --> Route
+  Route --> Config --> Map --> Rewrite --> Provider
 
   Provider --> Proxy --> Client
 ```
