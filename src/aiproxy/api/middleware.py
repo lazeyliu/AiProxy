@@ -140,12 +140,13 @@ def register_middlewares(app, settings, rate_limiter):
         log_cfg = get_logging_config()
         if log_cfg.get("include_headers") or log_cfg.get("include_body"):
             detail = {}
+            detail["url"] = request.url
             if log_cfg.get("include_headers"):
-                detail["headers"] = redact_headers(dict(request.headers), log_cfg.get("redact_headers", []))
+                detail["header"] = redact_headers(dict(request.headers), log_cfg.get("redact_headers", []))
             if log_cfg.get("include_body"):
                 if request.is_json:
                     body = request.get_json(silent=True)
-                    detail["body"] = redact_payload(body, log_cfg.get("redact_keys", []))
+                    detail["in-params"] = redact_payload(body, log_cfg.get("redact_keys", []))
                 else:
                     form_data = {}
                     if request.form:
@@ -186,7 +187,7 @@ def register_middlewares(app, settings, rate_limiter):
                             except Exception:
                                 file_entry["sha256_sample"] = None
                             files_info.append(file_entry)
-                    detail["body"] = {
+                    detail["in-params"] = {
                         "content_type": request.mimetype,
                         "content_length": request.content_length,
                         "form": form_data,
@@ -195,15 +196,15 @@ def register_middlewares(app, settings, rate_limiter):
             if log_cfg.get("include_body"):
                 try:
                     if getattr(response, "is_streamed", False) or getattr(response, "direct_passthrough", False):
-                        detail["response"] = "[stream omitted]"
+                        detail["out-params"] = "[stream omitted]"
                     elif response.mimetype == "text/event-stream":
-                        detail["response"] = "[sse omitted]"
+                        detail["out-params"] = "[sse omitted]"
                     else:
                         max_len = int(log_cfg.get("max_body_length") or 4096)
                         content_len = response.content_length
                         mimetype = response.mimetype or ""
                         if content_len is not None and content_len > max_len:
-                            detail["response"] = f"[body omitted: {content_len} bytes]"
+                            detail["out-params"] = f"[body omitted: {content_len} bytes]"
                         elif mimetype.startswith("text/") or mimetype in ("application/json", "application/problem+json"):
                             response_body = None
                             if isinstance(response.response, list):
@@ -223,7 +224,7 @@ def register_middlewares(app, settings, rate_limiter):
                             elif hasattr(response, "get_data") and content_len is not None:
                                 response_body = response.get_data()
                             if response_body is None:
-                                detail["response"] = "[body omitted: unknown length]"
+                                detail["out-params"] = "[body omitted: unknown length]"
                             else:
                                 truncated = response_body[:max_len]
                                 text = truncated.decode("utf-8", errors="replace")
@@ -231,11 +232,11 @@ def register_middlewares(app, settings, rate_limiter):
                                     text += "...(truncated)"
                                 elif content_len is not None and content_len > max_len:
                                     text += "...(truncated)"
-                                detail["response"] = text
+                                detail["out-params"] = text
                         else:
-                            detail["response"] = "[binary omitted]"
+                            detail["out-params"] = "[binary omitted]"
                 except Exception:
-                    detail["response"] = None
+                    detail["out-params"] = None
             if detail:
                 log_event(20, "request_detail", request_id=getattr(g, "request_id", ""), **detail)
         return response
