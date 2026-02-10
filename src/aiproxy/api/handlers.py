@@ -70,6 +70,14 @@ def _accepts_sse(req):
     return "text/event-stream" in accept
 
 
+def _ordered_payload(payload: dict, key_order: list[str]) -> dict:
+    ordered = {key: payload[key] for key in key_order if key in payload}
+    for key, value in payload.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def _resolve_request_model(payload_dict):
     requested_id = payload_dict.get("model")
     resolved = resolve_model_config(requested_id)
@@ -776,8 +784,10 @@ def register_routes(app, settings):
                 return error_response(str(e), 500, "internal_error")
 
             choices = getattr(response_obj, "choices", None) or []
-            message = getattr(choices[0], "message", None) if choices else None
+            first_choice = choices[0] if choices else None
+            message = getattr(first_choice, "message", None) if first_choice else None
             content = getattr(message, "content", None) if message else ""
+            finish_reason = getattr(first_choice, "finish_reason", None) if first_choice else None
             usage = _extract_usage_dict(getattr(response_obj, "usage", None))
             if usage is None:
                 prompt_tokens = count_text_tokens(prompt_text, model=resolved["model"])
@@ -797,7 +807,7 @@ def register_routes(app, settings):
                         {
                             "index": 0,
                             "text": content,
-                            "finish_reason": "stop",
+                            "finish_reason": finish_reason or "stop",
                             "logprobs": None,
                         }
                     ],
@@ -903,10 +913,27 @@ def register_routes(app, settings):
             except Exception as e:
                 return error_response(str(e), 500, "internal_error")
 
-            choices = getattr(response_obj, "choices", None) or []
-            message = getattr(choices[0], "message", None) if choices else None
-            content = getattr(message, "content", None) if message else ""
-            usage = _extract_usage_dict(getattr(response_obj, "usage", None))
+            response_payload = None
+            if hasattr(response_obj, "model_dump"):
+                response_payload = response_obj.model_dump()
+            elif hasattr(response_obj, "dict"):
+                response_payload = response_obj.dict()
+            elif isinstance(response_obj, dict):
+                response_payload = response_obj
+            if response_payload:
+                response_payload["model"] = resolved["id"]
+                if "id" not in response_payload:
+                    response_payload["id"] = _make_response_id("chatcmpl")
+                if "object" not in response_payload:
+                    response_payload["object"] = "chat.completion"
+                if "created" not in response_payload:
+                    response_payload["created"] = int(time.time())
+            choices = (response_payload or {}).get("choices") if response_payload else (getattr(response_obj, "choices", None) or [])
+            first_choice = choices[0] if choices else None
+            message = (first_choice or {}).get("message") if isinstance(first_choice, dict) else getattr(first_choice, "message", None)
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None) if message else ""
+            finish_reason = (first_choice or {}).get("finish_reason") if isinstance(first_choice, dict) else getattr(first_choice, "finish_reason", None)
+            usage = _extract_usage_dict((response_payload or {}).get("usage") if response_payload else getattr(response_obj, "usage", None))
             if usage is None:
                 prompt_tokens = count_messages_tokens(messages, model=resolved["model"])
                 completion_tokens = count_text_tokens(content, model=resolved["model"])
@@ -934,13 +961,20 @@ def register_routes(app, settings):
                             {
                                 "index": 0,
                                 "text": content,
-                                "finish_reason": "stop",
+                                "finish_reason": finish_reason or "stop",
                                 "logprobs": None,
                             }
                         ],
                         "usage": usage,
                     }
                 )
+            if response_payload:
+                response_payload["usage"] = response_payload.get("usage") or usage
+                response_payload = _ordered_payload(
+                    response_payload,
+                    ["id", "object", "created", "model", "choices", "usage"],
+                )
+                return jsonify(response_payload)
             return jsonify(
                 {
                     "id": _make_response_id("chatcmpl"),
@@ -954,7 +988,7 @@ def register_routes(app, settings):
                                 "role": "assistant",
                                 "content": content,
                             },
-                            "finish_reason": "stop",
+                            "finish_reason": finish_reason or "stop",
                         }
                     ],
                     "usage": usage,
@@ -1083,6 +1117,10 @@ def register_routes(app, settings):
                     ],
                     "usage": usage,
                 }
+                response_payload = _ordered_payload(
+                    response_payload,
+                    ["id", "object", "created_at", "model", "status", "output", "usage"],
+                )
                 return jsonify(response_payload)
             responses_payload = _build_responses_payload(data, resolved["model"])
             if "input" not in responses_payload:
@@ -1266,6 +1304,10 @@ def register_routes(app, settings):
                     "output_tokens": output_tokens,
                     "total_tokens": input_tokens + output_tokens,
                 }
+            response_payload = _ordered_payload(
+                response_payload,
+                ["id", "object", "created_at", "model", "status", "output", "usage"],
+            )
             return jsonify(response_payload)
 
         except Exception as e:
@@ -1335,11 +1377,43 @@ def register_routes(app, settings):
             except Exception as e:
                 return error_response(str(e), 500, "internal_error")
 
+            response_payload = None
             if hasattr(response_obj, "model_dump"):
-                return jsonify(response_obj.model_dump())
-            if hasattr(response_obj, "dict"):
-                return jsonify(response_obj.dict())
-            return jsonify(response_obj)
+                response_payload = response_obj.model_dump()
+            elif hasattr(response_obj, "dict"):
+                response_payload = response_obj.dict()
+            elif isinstance(response_obj, dict):
+                response_payload = response_obj
+            if response_payload is None:
+                return jsonify(response_obj)
+            if response_payload.get("object") is None:
+                response_payload["object"] = "list"
+            if response_payload.get("model") is None:
+                response_payload["model"] = resolved["id"]
+            data_items = response_payload.get("data")
+            if isinstance(data_items, list):
+                for idx, item in enumerate(data_items):
+                    if not isinstance(item, dict):
+                        continue
+                    item.setdefault("object", "embedding")
+                    item.setdefault("index", idx)
+            if not response_payload.get("usage"):
+                raw_input = params.get("input")
+                texts = []
+                if isinstance(raw_input, list):
+                    texts = [str(v) for v in raw_input]
+                elif raw_input is not None:
+                    texts = [str(raw_input)]
+                prompt_tokens = sum(count_text_tokens(text, model=resolved["model"]) for text in texts)
+                response_payload["usage"] = {
+                    "prompt_tokens": prompt_tokens,
+                    "total_tokens": prompt_tokens,
+                }
+            response_payload = _ordered_payload(
+                response_payload,
+                ["object", "data", "model", "usage"],
+            )
+            return jsonify(response_payload)
 
         except Exception as e:
             log_event(40, "embeddings_error", error=str(e), request_id=g.request_id)

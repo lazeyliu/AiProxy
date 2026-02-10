@@ -91,6 +91,7 @@ def extract_chat_params(payload_dict):
         "temperature",
         "top_p",
         "max_tokens",
+        "max_output_tokens",
         "max_completion_tokens",
         "presence_penalty",
         "frequency_penalty",
@@ -109,7 +110,12 @@ def extract_chat_params(payload_dict):
         "stream_options",
         "modalities",
     }
-    return {key: value for key, value in payload_dict.items() if key in allowed and key not in excluded}
+    params = {key: value for key, value in payload_dict.items() if key in allowed and key not in excluded}
+    if "max_tokens" not in params and "max_output_tokens" in params:
+        params["max_tokens"] = params.pop("max_output_tokens")
+    else:
+        params.pop("max_output_tokens", None)
+    return params
 
 
 def extract_chat_params_from_responses(payload_dict):
