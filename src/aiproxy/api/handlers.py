@@ -65,6 +65,11 @@ def _build_client(settings, base_url, api_key):
     )
 
 
+def _accepts_sse(req):
+    accept = (req.headers.get("Accept") or "").lower()
+    return "text/event-stream" in accept
+
+
 def _resolve_request_model(payload_dict):
     requested_id = payload_dict.get("model")
     resolved = resolve_model_config(requested_id)
@@ -819,6 +824,8 @@ def register_routes(app, settings):
             messages = [msg.model_dump(exclude_none=True) for msg in payload.messages]
             messages = coerce_messages_for_chat(messages)
             stream = payload.stream
+            if stream and not _accepts_sse(request):
+                stream = False
             params = extract_chat_params(payload_dict)
             resolved, error_message = _resolve_request_model(payload_dict)
             if error_message:
@@ -956,6 +963,8 @@ def register_routes(app, settings):
                 return error_response(str(e), 400, "invalid_request_error")
             payload_dict = payload.model_dump(exclude_none=True)
             stream = payload.stream
+            if stream and not _accepts_sse(request):
+                stream = False
             resolved, error_message = _resolve_request_model(payload_dict)
             if error_message:
                 return error_response(error_message, 400)
