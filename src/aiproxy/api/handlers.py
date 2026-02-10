@@ -1,6 +1,8 @@
 """Route handlers for AIProxy endpoints."""
 import time
 import json
+import os
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from datetime import datetime
@@ -18,6 +20,7 @@ from ..core.config import (
 )
 from ..utils.http import error_response
 from ..utils.logging import get_file_logger, log_event, redact_payload
+from ..utils.local_store import LocalStore
 from ..utils.params import (
     coerce_messages_for_chat,
     extract_chat_params,
@@ -32,6 +35,16 @@ from ..services.openai_service import (
     stream_response,
 )
 from .streaming import stream_chat_sse, stream_responses_sse, stream_responses_sse_from_chat
+
+_local_store = None
+
+
+def _get_local_store(settings) -> LocalStore:
+    global _local_store
+    if _local_store is None:
+        base_dir = os.getenv("LOCAL_STORE_DIR", settings.log_dir)
+        _local_store = LocalStore(base_dir)
+    return _local_store
 
 
 def _build_client(settings, base_url, api_key):
@@ -94,6 +107,55 @@ def _build_upstream_url(base_url: str, endpoint: str) -> str:
     if not base_url:
         return ""
     return f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+
+def _build_upstream_url_with_query(base_url: str, endpoint: str) -> str:
+    url = _build_upstream_url(base_url, endpoint)
+    if not url:
+        return url
+    if request.query_string:
+        qs = request.query_string.decode()
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{qs}"
+    return url
+
+
+def _build_multipart_body(model_override: str | None):
+    boundary = uuid.uuid4().hex
+    body = bytearray()
+
+    def add_bytes(value: bytes):
+        body.extend(value)
+
+    def add_line(value: str = ""):
+        add_bytes(value.encode("utf-8"))
+        add_bytes(b"\r\n")
+
+    for key, value in request.form.items(multi=True):
+        if key == "model" and model_override:
+            value = model_override
+        add_line(f"--{boundary}")
+        add_line(f'Content-Disposition: form-data; name="{key}"')
+        add_line()
+        add_line(str(value))
+
+    for key, storage in request.files.items(multi=True):
+        filename = storage.filename or "file"
+        content_type = storage.mimetype or "application/octet-stream"
+        add_line(f"--{boundary}")
+        add_line(f'Content-Disposition: form-data; name="{key}"; filename="{filename}"')
+        add_line(f"Content-Type: {content_type}")
+        add_line()
+        file_bytes = storage.stream.read()
+        add_bytes(file_bytes)
+        add_bytes(b"\r\n")
+        try:
+            storage.stream.seek(0)
+        except Exception:
+            pass
+
+    add_line(f"--{boundary}--")
+    return bytes(body), boundary
 
 
 def _forward_request(
@@ -197,6 +259,13 @@ def _apply_instructions(messages, instructions):
 
 def register_routes(app, settings):
     """Register Flask routes on the app."""
+    store = _get_local_store(settings)
+
+    def _list_response(items):
+        return jsonify({"object": "list", "data": items, "has_more": False})
+
+    def _not_found(name: str, item_id: str):
+        return error_response(f"{name} '{item_id}' not found", 404, "invalid_request_error")
 
     @app.route('/', methods=['GET'])
     def index():
@@ -779,15 +848,372 @@ def register_routes(app, settings):
             if error_message:
                 return error_response(error_message, 400)
             g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "images/edits")
+            body, boundary = _build_multipart_body(resolved["model"])
             return _forward_request(
                 settings,
                 g.upstream_url,
                 resolved.get("api_key", ""),
+                body_override=body,
+                headers_override={"Content-Type": f"multipart/form-data; boundary={boundary}"},
                 expect_json=True,
             )
         except Exception as e:
             log_event(40, "images_edits_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
+
+    def _resolve_json_model_payload():
+        payload = request.get_json(silent=True) or {}
+        if "model" not in payload and "modelId" in payload:
+            payload["model"] = payload["modelId"]
+        resolved, error_message = _resolve_request_model(payload)
+        if error_message:
+            return None, None, None, error_response(error_message, 400)
+        if "model" in payload:
+            payload["model"] = resolved["model"]
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        return resolved, body, headers, None
+
+    def _resolve_model_from_form_or_query():
+        model = request.form.get("model") or request.args.get("model")
+        if not model and request.is_json:
+            data = request.get_json(silent=True) or {}
+            model = data.get("model") or data.get("modelId")
+        resolved, error_message = _resolve_request_model({"model": model} if model else {})
+        if error_message:
+            return None, error_response(error_message, 400)
+        return resolved, None
+
+    def _forward_openai_endpoint(endpoint: str, *, expect_json: bool, rewrite_model_in_multipart: bool = False):
+        if request.is_json:
+            resolved, body, headers, error = _resolve_json_model_payload()
+            if error:
+                return error
+            g.upstream_url = _build_upstream_url_with_query(resolved.get("base_url", ""), endpoint)
+            return _forward_request(
+                settings,
+                g.upstream_url,
+                resolved.get("api_key", ""),
+                body_override=body,
+                headers_override=headers,
+                expect_json=expect_json,
+            )
+        if request.mimetype == "multipart/form-data":
+            resolved, error = _resolve_model_from_form_or_query()
+            if error:
+                return error
+            model_override = resolved["model"] if rewrite_model_in_multipart else None
+            body, boundary = _build_multipart_body(model_override)
+            g.upstream_url = _build_upstream_url_with_query(resolved.get("base_url", ""), endpoint)
+            return _forward_request(
+                settings,
+                g.upstream_url,
+                resolved.get("api_key", ""),
+                body_override=body,
+                headers_override={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                expect_json=expect_json,
+            )
+        resolved, error_message = _resolve_request_model({})
+        if error_message:
+            return error_response("Model not specified and no default configured", 400, "invalid_request_error")
+        g.upstream_url = _build_upstream_url_with_query(resolved.get("base_url", ""), endpoint)
+        return _forward_request(
+            settings,
+            g.upstream_url,
+            resolved.get("api_key", ""),
+            expect_json=expect_json,
+        )
+
+    @app.route('/moderations', methods=['POST'])
+    @app.route('/v1/moderations', methods=['POST'])
+    def moderations():
+        try:
+            return _forward_openai_endpoint("moderations", expect_json=True)
+        except Exception as e:
+            log_event(40, "moderations_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
+
+    @app.route('/audio/transcriptions', methods=['POST'])
+    @app.route('/v1/audio/transcriptions', methods=['POST'])
+    def audio_transcriptions():
+        try:
+            return _forward_openai_endpoint("audio/transcriptions", expect_json=True, rewrite_model_in_multipart=True)
+        except Exception as e:
+            log_event(40, "audio_transcriptions_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
+
+    @app.route('/audio/translations', methods=['POST'])
+    @app.route('/v1/audio/translations', methods=['POST'])
+    def audio_translations():
+        try:
+            return _forward_openai_endpoint("audio/translations", expect_json=True, rewrite_model_in_multipart=True)
+        except Exception as e:
+            log_event(40, "audio_translations_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
+
+    @app.route('/audio/speech', methods=['POST'])
+    @app.route('/v1/audio/speech', methods=['POST'])
+    def audio_speech():
+        try:
+            return _forward_openai_endpoint("audio/speech", expect_json=False)
+        except Exception as e:
+            log_event(40, "audio_speech_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
+
+    @app.route('/assistants', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/assistants/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    @app.route('/v1/assistants', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/v1/assistants/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    def assistants(subpath=None):
+        payload = request.get_json(silent=True) or {}
+        if "model" not in payload and "modelId" in payload:
+            payload["model"] = payload["modelId"]
+        if not subpath:
+            if request.method == "GET":
+                return _list_response(store.list_items("assistant"))
+            if request.method in ("POST", "PATCH"):
+                item = store.create_item("assistant", payload)
+                return jsonify(item)
+        parts = subpath.split("/")
+        assistant_id = parts[0]
+        if len(parts) > 1 and parts[1] == "files":
+            if len(parts) == 2:
+                if request.method == "GET":
+                    return _list_response(store.list_items("assistant.file", parent_id=assistant_id))
+                if request.method == "POST":
+                    file_id = payload.get("file_id") or payload.get("file")
+                    item = store.create_item(
+                        "assistant.file",
+                        {"assistant_id": assistant_id, "file_id": file_id},
+                        parent_id=assistant_id,
+                    )
+                    return jsonify(item)
+            if len(parts) == 3 and request.method == "DELETE":
+                ok = store.delete_item("assistant.file", parts[2])
+                return jsonify({"id": parts[2], "object": "assistant.file.deleted", "deleted": ok})
+        if request.method == "GET":
+            item = store.get_item("assistant", assistant_id)
+            return jsonify(item) if item else _not_found("assistant", assistant_id)
+        if request.method in ("POST", "PATCH"):
+            item = store.update_item("assistant", assistant_id, payload)
+            return jsonify(item) if item else _not_found("assistant", assistant_id)
+        if request.method == "DELETE":
+            ok = store.delete_item("assistant", assistant_id)
+            return jsonify({"id": assistant_id, "object": "assistant.deleted", "deleted": ok})
+        return error_response("Method not allowed", 405, "invalid_request_error")
+
+    @app.route('/threads', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/threads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    @app.route('/v1/threads', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/v1/threads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    def threads(subpath=None):
+        payload = request.get_json(silent=True) or {}
+        if not subpath:
+            if request.method == "GET":
+                return _list_response(store.list_items("thread"))
+            if request.method in ("POST", "PATCH"):
+                messages = payload.pop("messages", None)
+                thread = store.create_item("thread", payload)
+                if isinstance(messages, list):
+                    for msg in messages:
+                        store.create_item(
+                            "thread.message",
+                            {"thread_id": thread["id"], **(msg or {})},
+                            parent_id=thread["id"],
+                        )
+                return jsonify(thread)
+        parts = subpath.split("/")
+        thread_id = parts[0]
+        if len(parts) == 1:
+            if request.method == "GET":
+                item = store.get_item("thread", thread_id)
+                return jsonify(item) if item else _not_found("thread", thread_id)
+            if request.method in ("POST", "PATCH"):
+                item = store.update_item("thread", thread_id, payload)
+                return jsonify(item) if item else _not_found("thread", thread_id)
+            if request.method == "DELETE":
+                ok = store.delete_item("thread", thread_id)
+                return jsonify({"id": thread_id, "object": "thread.deleted", "deleted": ok})
+        if len(parts) >= 2 and parts[1] == "messages":
+            if len(parts) == 2:
+                if request.method == "GET":
+                    return _list_response(store.list_items("thread.message", parent_id=thread_id))
+                if request.method == "POST":
+                    msg = store.create_item(
+                        "thread.message",
+                        {"thread_id": thread_id, **payload},
+                        parent_id=thread_id,
+                    )
+                    return jsonify(msg)
+            if len(parts) == 3 and request.method == "GET":
+                item = store.get_item("thread.message", parts[2])
+                return jsonify(item) if item else _not_found("thread.message", parts[2])
+        if len(parts) >= 2 and parts[1] == "runs":
+            if len(parts) == 2:
+                if request.method == "GET":
+                    return _list_response(store.list_items("thread.run", parent_id=thread_id))
+                if request.method == "POST":
+                    run_data = {"thread_id": thread_id, "status": "completed", **payload}
+                    run = store.create_item("thread.run", run_data, parent_id=thread_id)
+                    # Create a placeholder assistant message to keep clients unblocked.
+                    store.create_item(
+                        "thread.message",
+                        {
+                            "thread_id": thread_id,
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": ""}],
+                        },
+                        parent_id=thread_id,
+                    )
+                    return jsonify(run)
+            if len(parts) >= 3:
+                run_id = parts[2]
+                if len(parts) == 3 and request.method == "GET":
+                    item = store.get_item("thread.run", run_id)
+                    return jsonify(item) if item else _not_found("thread.run", run_id)
+                if len(parts) == 4 and parts[3] == "steps" and request.method == "GET":
+                    return _list_response([])
+        return error_response("Not found", 404, "invalid_request_error")
+
+    @app.route('/vector_stores', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/vector_stores/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    @app.route('/v1/vector_stores', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/v1/vector_stores/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    def vector_stores(subpath=None):
+        payload = request.get_json(silent=True) or {}
+        if not subpath:
+            if request.method == "GET":
+                return _list_response(store.list_items("vector_store"))
+            if request.method in ("POST", "PATCH"):
+                item = store.create_item("vector_store", payload)
+                return jsonify(item)
+        parts = subpath.split("/")
+        store_id = parts[0]
+        if len(parts) == 1:
+            if request.method == "GET":
+                item = store.get_item("vector_store", store_id)
+                return jsonify(item) if item else _not_found("vector_store", store_id)
+            if request.method in ("POST", "PATCH"):
+                item = store.update_item("vector_store", store_id, payload)
+                return jsonify(item) if item else _not_found("vector_store", store_id)
+            if request.method == "DELETE":
+                ok = store.delete_item("vector_store", store_id)
+                return jsonify({"id": store_id, "object": "vector_store.deleted", "deleted": ok})
+        if len(parts) >= 2 and parts[1] == "files":
+            if len(parts) == 2:
+                if request.method == "GET":
+                    return _list_response(store.list_items("vector_store.file", parent_id=store_id))
+                if request.method == "POST":
+                    file_id = payload.get("file_id") or payload.get("file")
+                    item = store.create_item(
+                        "vector_store.file",
+                        {"vector_store_id": store_id, "file_id": file_id},
+                        parent_id=store_id,
+                    )
+                    return jsonify(item)
+            if len(parts) == 3 and request.method == "DELETE":
+                ok = store.delete_item("vector_store.file", parts[2])
+                return jsonify({"id": parts[2], "object": "vector_store.file.deleted", "deleted": ok})
+        return error_response("Not found", 404, "invalid_request_error")
+
+    @app.route('/files', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/files/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    @app.route('/v1/files', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/v1/files/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    def files(subpath=None):
+        if not subpath:
+            if request.method == "GET":
+                return _list_response(store.list_items("file"))
+            if request.method in ("POST", "PATCH"):
+                if request.mimetype == "multipart/form-data":
+                    storage = request.files.get("file")
+                    if not storage:
+                        return error_response("No file provided", 400, "invalid_request_error")
+                    content = storage.read()
+                    info = store.create_file(storage.filename or "file", storage.mimetype or "application/octet-stream", content)
+                    item = store.create_item("file", {k: v for k, v in info.items() if k != "id"}, item_id=info["id"])
+                    purpose = request.form.get("purpose")
+                    if purpose:
+                        item = store.update_item("file", info["id"], {"purpose": purpose})
+                    return jsonify(item)
+                payload = request.get_json(silent=True) or {}
+                item = store.create_item("file", payload)
+                return jsonify(item)
+        parts = subpath.split("/")
+        file_id = parts[0]
+        if len(parts) == 1:
+            if request.method == "GET":
+                item = store.get_item("file", file_id)
+                return jsonify(item) if item else _not_found("file", file_id)
+            if request.method == "DELETE":
+                ok = store.delete_item("file", file_id)
+                store.delete_file(file_id)
+                return jsonify({"id": file_id, "object": "file.deleted", "deleted": ok})
+        if len(parts) == 2 and parts[1] == "content" and request.method == "GET":
+            file_info = store.get_file(file_id)
+            if not file_info:
+                return _not_found("file", file_id)
+            with open(file_info["path"], "rb") as f:
+                data = f.read()
+            response = Response(data, status=200)
+            response.headers["Content-Type"] = file_info.get("content_type") or "application/octet-stream"
+            return response
+        return error_response("Not found", 404, "invalid_request_error")
+
+    @app.route('/uploads', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/uploads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    @app.route('/v1/uploads', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/v1/uploads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    def uploads(subpath=None):
+        payload = request.get_json(silent=True) or {}
+        if not subpath:
+            if request.method == "GET":
+                return _list_response(store.list_items("upload"))
+            if request.method in ("POST", "PATCH"):
+                item = store.create_item("upload", payload)
+                return jsonify(item)
+        parts = subpath.split("/")
+        upload_id = parts[0]
+        if len(parts) == 1:
+            if request.method == "GET":
+                item = store.get_item("upload", upload_id)
+                return jsonify(item) if item else _not_found("upload", upload_id)
+            if request.method == "DELETE":
+                ok = store.delete_item("upload", upload_id)
+                return jsonify({"id": upload_id, "object": "upload.deleted", "deleted": ok})
+        if len(parts) >= 2 and parts[1] == "parts" and request.method == "POST":
+            data = request.get_data() or b""
+            item = store.create_item(
+                "upload.part",
+                {"upload_id": upload_id, "bytes": len(data)},
+                parent_id=upload_id,
+            )
+            return jsonify(item)
+        return error_response("Not found", 404, "invalid_request_error")
+
+    @app.route('/batches', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/batches/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    @app.route('/v1/batches', methods=['GET', 'POST', 'PATCH'])
+    @app.route('/v1/batches/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
+    def batches(subpath=None):
+        payload = request.get_json(silent=True) or {}
+        if not subpath:
+            if request.method == "GET":
+                return _list_response(store.list_items("batch"))
+            if request.method in ("POST", "PATCH"):
+                item = store.create_item("batch", payload)
+                return jsonify(item)
+        batch_id = subpath.split("/")[0] if subpath else ""
+        if request.method == "GET":
+            item = store.get_item("batch", batch_id)
+            return jsonify(item) if item else _not_found("batch", batch_id)
+        if request.method in ("POST", "PATCH"):
+            item = store.update_item("batch", batch_id, payload)
+            return jsonify(item) if item else _not_found("batch", batch_id)
+        if request.method == "DELETE":
+            ok = store.delete_item("batch", batch_id)
+            return jsonify({"id": batch_id, "object": "batch.deleted", "deleted": ok})
+        return error_response("Not found", 404, "invalid_request_error")
 
     @app.route('/models', methods=['GET'])
     @app.route('/v1/models', methods=['GET'])
