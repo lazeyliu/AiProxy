@@ -126,7 +126,7 @@ def extract_chat_params_from_responses(payload_dict):
     if "tools" in payload_dict:
         params["tools"] = _normalize_tools_for_chat(payload_dict["tools"])
     if "tool_choice" in payload_dict:
-        params["tool_choice"] = payload_dict["tool_choice"]
+        params["tool_choice"] = _normalize_tool_choice_for_chat(payload_dict["tool_choice"])
     if "response_format" in payload_dict:
         params["response_format"] = payload_dict["response_format"]
     if "metadata" in payload_dict:
@@ -166,6 +166,17 @@ def _normalize_tools_for_chat(tools):
             normalized.append({"type": "function", "function": func})
         # Drop non-function tools when falling back to chat.completions.
     return normalized
+
+
+def _normalize_tool_choice_for_chat(tool_choice):
+    """Normalize responses-style tool_choice into chat.completions format."""
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    if "function" in tool_choice:
+        return tool_choice
+    if tool_choice.get("type") == "function" and "name" in tool_choice:
+        return {"type": "function", "function": {"name": tool_choice.get("name")}}
+    return tool_choice
 
 
 def coerce_messages_for_chat(messages):
