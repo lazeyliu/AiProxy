@@ -289,6 +289,20 @@ def stream_responses_sse_from_chat(
         }
         yield "event: response.created\n"
         yield f"data: {json.dumps(created_event)}\n\n"
+        added_event = {
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": {
+                "id": output_item_id,
+                "type": "message",
+                "role": "assistant",
+                "status": "in_progress",
+                "content": [{"type": "output_text", "text": "", "annotations": []}],
+            },
+        }
+        yield "event: response.output_item.added\n"
+        yield f"data: {json.dumps(added_event)}\n\n"
 
         for chunk in stream:
             choice = _get_first_choice(chunk)
