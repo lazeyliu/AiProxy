@@ -6,7 +6,11 @@ import openai
 from ..services.openai_service import stream_chat_completion
 from ..utils.logging import log_event
 from ..utils.token_count import count_messages_tokens, count_text_tokens
-from ..utils.responses_adapter import build_response_completed_payload
+from ..utils.responses_adapter import (
+    build_output_message_item,
+    build_response_completed_payload,
+    dump_output_item,
+)
 
 
 def _dump_event(event):
@@ -146,11 +150,11 @@ def stream_responses_sse_from_chat(
     """Fallback: stream /v1/responses format using chat.completions."""
     try:
         stream = stream_chat_completion(client, model, messages, **kwargs)
-        output_text = ""
-        output_item_id = f"msg_{int(time.time() * 1000)}"
         sequence_number = 0
-        message_output_index = None
-        tool_items: dict[int, dict] = {}
+        message_states: dict[int, dict] = {}
+        tool_states: dict[tuple[int, str], dict] = {}
+        used_output_indices: set[int] = set()
+        next_output_index = 0
         created_event = {
             "type": "response.created",
             "response": {
@@ -165,201 +169,227 @@ def stream_responses_sse_from_chat(
         yield "event: response.created\n"
         yield f"data: {json.dumps(created_event)}\n\n"
 
-        def ensure_message_item():
-            nonlocal message_output_index
-            if message_output_index is not None:
-                return
-            message_output_index = 0
+        def alloc_output_index(preferred: int | None = None) -> int:
+            nonlocal next_output_index
+            if isinstance(preferred, int) and preferred >= 0 and preferred not in used_output_indices:
+                used_output_indices.add(preferred)
+                next_output_index = max(next_output_index, preferred + 1)
+                return preferred
+            while next_output_index in used_output_indices:
+                next_output_index += 1
+            idx = next_output_index
+            used_output_indices.add(idx)
+            next_output_index += 1
+            return idx
+
+        def ensure_message_item(choice_index: int):
+            state = message_states.get(choice_index)
+            if state is not None:
+                return state, []
+            output_index = alloc_output_index(choice_index)
+            item_id = f"msg_{response_id}_{choice_index}"
+            item_obj = build_output_message_item(
+                item_id=item_id, text="", status="in_progress"
+            )
+            state = {
+                "output_index": output_index,
+                "item_id": item_id,
+                "item": item_obj,
+                "text": "",
+            }
+            message_states[choice_index] = state
             added_event = {
                 "type": "response.output_item.added",
                 "response_id": response_id,
-                "output_index": message_output_index,
-                "item": {
-                    "id": output_item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "in_progress",
-                    "content": [{"type": "output_text", "text": "", "annotations": []}],
-                },
+                "output_index": output_index,
+                "item": dump_output_item(item_obj),
             }
-            yield "event: response.output_item.added\n"
-            yield f"data: {json.dumps(added_event)}\n\n"
             text_added_event = {
                 "type": "response.output_text.added",
                 "response_id": response_id,
-                "item_id": output_item_id,
-                "output_index": message_output_index,
+                "item_id": item_id,
+                "output_index": output_index,
                 "content_index": 0,
                 "text": "",
             }
-            yield "event: response.output_text.added\n"
-            yield f"data: {json.dumps(text_added_event)}\n\n"
+            events = [
+                f"event: response.output_item.added\n",
+                f"data: {json.dumps(added_event)}\n\n",
+                f"event: response.output_text.added\n",
+                f"data: {json.dumps(text_added_event)}\n\n",
+            ]
+            return state, events
 
         for chunk in stream:
-            choice = _get_first_choice(chunk)
-            if not choice:
-                continue
-            delta_obj = getattr(choice, "delta", None)
-            delta = getattr(delta_obj, "content", None)
-            if isinstance(delta, str) and delta:
-                output_text += delta
-            tool_calls = getattr(delta_obj, "tool_calls", None)
-            if not isinstance(tool_calls, list) or not tool_calls:
-                function_call = getattr(delta_obj, "function_call", None)
-                if isinstance(function_call, dict):
-                    tool_calls = [{"index": 0, "function": function_call}]
-            if (isinstance(delta, str) and delta) or (isinstance(tool_calls, list) and tool_calls):
-                yield from ensure_message_item()
-            if isinstance(tool_calls, list):
-                for i, call in enumerate(tool_calls):
-                    call_payload = _dump_delta(call)
-                    index = call_payload.get("index", i)
-                    if not isinstance(index, int):
-                        try:
-                            index = int(index)
-                        except (TypeError, ValueError):
-                            index = i
-                    call_id = call_payload.get("id") or f"call_{index}"
-                    function = call_payload.get("function") or {}
-                    name = function.get("name")
-                    args_delta = function.get("arguments") or ""
-                    state = tool_items.get(index)
-                    if state is None:
-                        output_index = index + 1 if isinstance(index, int) and index >= 0 else len(tool_items) + 1
-                        state = {
-                            "output_index": output_index,
-                            "item_id": f"tool_{call_id}",
-                            "call_id": call_id,
-                            "name": name or "",
-                            "arguments": "",
-                        }
-                        tool_items[index] = state
-                        tool_added_event = {
-                            "type": "response.output_item.added",
-                            "response_id": response_id,
-                            "output_index": output_index,
-                            "item": {
-                                "id": state["item_id"],
-                                "type": "tool_call",
-                                "status": "in_progress",
+            choices = getattr(chunk, "choices", None) or []
+            if not isinstance(choices, list):
+                choices = []
+            for ordinal, choice in enumerate(choices):
+                choice_index = getattr(choice, "index", None)
+                if choice_index is None and isinstance(choice, dict):
+                    choice_index = choice.get("index")
+                if not isinstance(choice_index, int):
+                    choice_index = ordinal
+                delta_obj = getattr(choice, "delta", None)
+                delta = getattr(delta_obj, "content", None)
+                tool_calls = getattr(delta_obj, "tool_calls", None)
+                if not isinstance(tool_calls, list) or not tool_calls:
+                    function_call = getattr(delta_obj, "function_call", None)
+                    if isinstance(function_call, dict):
+                        tool_calls = [{"index": 0, "function": function_call}]
+                if (isinstance(delta, str) and delta) or (isinstance(tool_calls, list) and tool_calls):
+                    message_state, events = ensure_message_item(choice_index)
+                    for evt in events:
+                        yield evt
+                else:
+                    message_state = message_states.get(choice_index)
+                if isinstance(delta, str) and delta and isinstance(message_state, dict):
+                    message_state["text"] += delta
+                    delta_event = {
+                        "type": "response.output_text.delta",
+                        "response_id": response_id,
+                        "item_id": message_state["item_id"],
+                        "delta": delta,
+                        "output_index": message_state["output_index"],
+                        "content_index": 0,
+                        "sequence_number": sequence_number,
+                    }
+                    sequence_number += 1
+                    yield "event: response.output_text.delta\n"
+                    yield f"data: {json.dumps(delta_event)}\n\n"
+                if isinstance(tool_calls, list):
+                    for i, call in enumerate(tool_calls):
+                        call_payload = _dump_delta(call)
+                        tool_index = call_payload.get("index", i)
+                        if not isinstance(tool_index, int):
+                            try:
+                                tool_index = int(tool_index)
+                            except (TypeError, ValueError):
+                                tool_index = i
+                        call_id = call_payload.get("id") or f"call_{choice_index}_{tool_index}"
+                        function = call_payload.get("function") or {}
+                        name = function.get("name") if isinstance(function, dict) else None
+                        args_delta = function.get("arguments") if isinstance(function, dict) else None
+                        args_delta = args_delta or ""
+                        tool_key = (choice_index, str(call_id))
+                        state = tool_states.get(tool_key)
+                        if state is None:
+                            output_index = alloc_output_index()
+                            state = {
+                                "output_index": output_index,
+                                "item_id": f"tool_{call_id}",
                                 "call_id": call_id,
-                                "name": state["name"],
+                                "name": name or "",
                                 "arguments": "",
-                            },
-                        }
-                        yield "event: response.output_item.added\n"
-                        yield f"data: {json.dumps(tool_added_event)}\n\n"
-                    if name and not state["name"]:
-                        state["name"] = name
-                    if isinstance(args_delta, str) and args_delta:
-                        state["arguments"] += args_delta
-                        args_event = {
-                            "type": "response.function_call_arguments.delta",
-                            "response_id": response_id,
-                            "item_id": state["item_id"],
-                            "output_index": state["output_index"],
-                            "delta": args_delta,
-                        }
-                        yield "event: response.function_call_arguments.delta\n"
-                        yield f"data: {json.dumps(args_event)}\n\n"
-            if isinstance(delta, str) and delta:
-                delta_event = {
-                    "type": "response.output_text.delta",
+                            }
+                            tool_states[tool_key] = state
+                            tool_added_event = {
+                                "type": "response.output_item.added",
+                                "response_id": response_id,
+                                "output_index": output_index,
+                                "item": {
+                                    "id": state["item_id"],
+                                    "type": "tool_call",
+                                    "status": "in_progress",
+                                    "call_id": call_id,
+                                    "name": state["name"],
+                                    "arguments": "",
+                                },
+                            }
+                            yield "event: response.output_item.added\n"
+                            yield f"data: {json.dumps(tool_added_event)}\n\n"
+                        if name and not state["name"]:
+                            state["name"] = name
+                        if isinstance(args_delta, str) and args_delta:
+                            state["arguments"] += args_delta
+                            args_event = {
+                                "type": "response.function_call_arguments.delta",
+                                "response_id": response_id,
+                                "item_id": state["item_id"],
+                                "output_index": state["output_index"],
+                                "delta": args_delta,
+                            }
+                            yield "event: response.function_call_arguments.delta\n"
+                            yield f"data: {json.dumps(args_event)}\n\n"
+
+        output_items = []
+        output_texts = []
+        tool_args_texts = []
+        final_items = []
+        for state in message_states.values():
+            final_items.append((state["output_index"], "message", state))
+        for state in tool_states.values():
+            final_items.append((state["output_index"], "tool", state))
+        for _, kind, state in sorted(final_items, key=lambda item: item[0]):
+            if kind == "message":
+                output_texts.append(state["text"])
+                done_event = {
+                    "type": "response.output_text.done",
                     "response_id": response_id,
-                    "item_id": output_item_id,
-                    "delta": delta,
-                    "output_index": message_output_index,
+                    "item_id": state["item_id"],
+                    "text": state["text"],
+                    "output_index": state["output_index"],
                     "content_index": 0,
                     "sequence_number": sequence_number,
                 }
                 sequence_number += 1
-                yield "event: response.output_text.delta\n"
-                yield f"data: {json.dumps(delta_event)}\n\n"
-
-        if message_output_index is not None:
-            done_event = {
-                "type": "response.output_text.done",
-                "response_id": response_id,
-                "item_id": output_item_id,
-                "text": output_text,
-                "output_index": message_output_index,
-                "content_index": 0,
-                "sequence_number": sequence_number,
-            }
-            sequence_number += 1
-            yield "event: response.output_text.done\n"
-            yield f"data: {json.dumps(done_event)}\n\n"
-            item_done_event = {
-                "type": "response.output_item.done",
-                "response_id": response_id,
-                "output_index": message_output_index,
-                "item": {
-                    "id": output_item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": output_text, "annotations": []}],
-                },
-            }
-            yield "event: response.output_item.done\n"
-            yield f"data: {json.dumps(item_done_event)}\n\n"
-        for index in sorted(tool_items.keys()):
-            state = tool_items.get(index)
-            if not state:
-                continue
-            args_done_event = {
-                "type": "response.function_call_arguments.done",
-                "response_id": response_id,
-                "item_id": state["item_id"],
-                "output_index": state["output_index"],
-                "arguments": state["arguments"],
-            }
-            yield "event: response.function_call_arguments.done\n"
-            yield f"data: {json.dumps(args_done_event)}\n\n"
-            tool_done_event = {
-                "type": "response.output_item.done",
-                "response_id": response_id,
-                "output_index": state["output_index"],
-                "item": {
-                    "id": state["item_id"],
-                    "type": "tool_call",
-                    "status": "completed",
-                    "call_id": state["call_id"],
-                    "name": state["name"],
+                yield "event: response.output_text.done\n"
+                yield f"data: {json.dumps(done_event)}\n\n"
+                completed_item = build_output_message_item(
+                    item_id=state["item_id"],
+                    text=state["text"],
+                    status="completed",
+                )
+                item_done_event = {
+                    "type": "response.output_item.done",
+                    "response_id": response_id,
+                    "output_index": state["output_index"],
+                    "item": dump_output_item(completed_item),
+                }
+                yield "event: response.output_item.done\n"
+                yield f"data: {json.dumps(item_done_event)}\n\n"
+                output_items.append(completed_item)
+            else:
+                tool_args_texts.append(state["arguments"])
+                args_done_event = {
+                    "type": "response.function_call_arguments.done",
+                    "response_id": response_id,
+                    "item_id": state["item_id"],
+                    "output_index": state["output_index"],
                     "arguments": state["arguments"],
-                },
-            }
-            yield "event: response.output_item.done\n"
-            yield f"data: {json.dumps(tool_done_event)}\n\n"
+                }
+                yield "event: response.function_call_arguments.done\n"
+                yield f"data: {json.dumps(args_done_event)}\n\n"
+                tool_done_event = {
+                    "type": "response.output_item.done",
+                    "response_id": response_id,
+                    "output_index": state["output_index"],
+                    "item": {
+                        "id": state["item_id"],
+                        "type": "tool_call",
+                        "status": "completed",
+                        "call_id": state["call_id"],
+                        "name": state["name"],
+                        "arguments": state["arguments"],
+                    },
+                }
+                yield "event: response.output_item.done\n"
+                yield f"data: {json.dumps(tool_done_event)}\n\n"
+                output_items.append(tool_done_event["item"])
+
+        if not output_items:
+            output_items.append(
+                build_output_message_item(item_id=f"msg_{response_id}", text="", status="completed")
+            )
 
         input_tokens = count_messages_tokens(messages, model=response_model)
-        tool_args_text = "".join(state["arguments"] for state in tool_items.values() if state.get("arguments"))
-        output_tokens = count_text_tokens(output_text + tool_args_text, model=response_model)
-        output_items = []
-        if message_output_index is not None:
-            output_items.append(
-                {
-                    "id": output_item_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": output_text, "annotations": []}],
-                }
-            )
-        for index in sorted(tool_items.keys()):
-            state = tool_items.get(index)
-            if not state:
-                continue
-            output_items.append(
-                {
-                    "id": state["item_id"],
-                    "type": "tool_call",
-                    "status": "completed",
-                    "call_id": state["call_id"],
-                    "name": state["name"],
-                    "arguments": state["arguments"],
-                }
-            )
+        output_tokens = 0
+        for text in output_texts:
+            if text:
+                output_tokens += count_text_tokens(text, model=response_model)
+        for args in tool_args_texts:
+            if args:
+                output_tokens += count_text_tokens(args, model=response_model)
         response_dump = build_response_completed_payload(
             response_id=response_id,
             created=created,

@@ -21,6 +21,9 @@
     "redact_headers": ["authorization", "x-api-key", "api-key"],
     "redact_keys": ["api_key", "apiKey", "access_keys"]
   },
+  "responses": {
+    "mode": "auto"
+  },
   "providers": {
     "gemini": {
       "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",

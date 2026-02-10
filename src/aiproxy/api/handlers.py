@@ -19,6 +19,7 @@ from ..utils.params import (
     extract_chat_params_from_responses,
     normalize_messages_from_input,
 )
+from ..utils.chat_adapter import ensure_chat_completion_model
 from ..utils.responses_adapter import build_response_payload_from_chat
 from ..services.openai_service import create_client
 from .streaming import stream_openai_sse, stream_responses_sse_from_chat
@@ -274,11 +275,13 @@ def register_routes(app, settings):
                 )
             if not hasattr(client.chat.completions, "with_raw_response"):
                 response_obj = client.chat.completions.create(**payload)
+                response_obj = ensure_chat_completion_model(response_obj)
                 return jsonify(_model_dump(response_obj))
             response_obj = client.chat.completions.with_raw_response.create(**payload)
             if hasattr(response_obj, "parse"):
-                return jsonify(_model_dump(response_obj.parse()))
-            return jsonify(_model_dump(response_obj))
+                parsed = ensure_chat_completion_model(response_obj.parse())
+                return jsonify(_model_dump(parsed))
+            return jsonify(_model_dump(ensure_chat_completion_model(response_obj)))
         except Exception as e:
             log_event(40, "chat_completions_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
