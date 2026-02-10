@@ -1,6 +1,8 @@
 """Route handlers for AIProxy endpoints."""
 import time
 import json
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from datetime import datetime
 
 import openai
@@ -92,6 +94,52 @@ def _build_upstream_url(base_url: str, endpoint: str) -> str:
     if not base_url:
         return ""
     return f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+
+def _forward_request(
+    settings,
+    upstream_url: str,
+    api_key: str,
+    *,
+    body_override: bytes | None = None,
+    headers_override: dict | None = None,
+    expect_json: bool = False,
+):
+    if not upstream_url:
+        return error_response("Upstream URL not configured", 502, "api_error")
+    body = request.get_data() if body_override is None else body_override
+    headers = {}
+    for key, value in request.headers:
+        if key.lower() in ("host", "content-length", "authorization"):
+            continue
+        headers[key] = value
+    if headers_override:
+        headers.update(headers_override)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = Request(upstream_url, data=body, headers=headers, method=request.method)
+    try:
+        with urlopen(req, timeout=settings.upstream_timeout) as resp:
+            status = resp.status
+            resp_body = resp.read()
+            resp_headers = resp.headers
+    except HTTPError as e:
+        status = e.code
+        resp_body = e.read()
+        resp_headers = e.headers
+    except URLError as e:
+        return error_response(str(e), 502, "api_connection_error")
+    content_type = resp_headers.get("Content-Type", "")
+    if expect_json and "application/json" not in content_type.lower():
+        return error_response(
+            f"Upstream returned non-JSON response (status {status})",
+            status or 502,
+            "api_error",
+        )
+    response = Response(resp_body, status=status)
+    if content_type:
+        response.headers["Content-Type"] = content_type
+    return response
 
 
 def _build_responses_payload(data: dict, resolved_model: str) -> dict:
@@ -691,6 +739,54 @@ def register_routes(app, settings):
 
         except Exception as e:
             log_event(40, "embeddings_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
+
+    @app.route('/images/generations', methods=['POST'])
+    @app.route('/v1/images/generations', methods=['POST'])
+    def images_generations():
+        try:
+            data = request.get_json(silent=True) or {}
+            if "model" not in data and "modelId" in data:
+                data["model"] = data["modelId"]
+            resolved, error_message = _resolve_request_model(data)
+            if error_message:
+                return error_response(error_message, 400)
+            payload = dict(data)
+            payload["model"] = resolved["model"]
+            body = json.dumps(payload).encode("utf-8")
+            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "images/generations")
+            return _forward_request(
+                settings,
+                g.upstream_url,
+                resolved.get("api_key", ""),
+                body_override=body,
+                headers_override={"Content-Type": "application/json"},
+                expect_json=True,
+            )
+        except Exception as e:
+            log_event(40, "images_generations_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
+
+    @app.route('/images/edits', methods=['POST'])
+    @app.route('/v1/images/edits', methods=['POST'])
+    def images_edits():
+        try:
+            model = request.form.get("model") or request.args.get("model")
+            if not model and request.is_json:
+                data = request.get_json(silent=True) or {}
+                model = data.get("model") or data.get("modelId")
+            resolved, error_message = _resolve_request_model({"model": model} if model else {})
+            if error_message:
+                return error_response(error_message, 400)
+            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "images/edits")
+            return _forward_request(
+                settings,
+                g.upstream_url,
+                resolved.get("api_key", ""),
+                expect_json=True,
+            )
+        except Exception as e:
+            log_event(40, "images_edits_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
 
     @app.route('/models', methods=['GET'])
