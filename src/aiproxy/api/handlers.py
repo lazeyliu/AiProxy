@@ -1,59 +1,20 @@
 """Route handlers for AIProxy endpoints."""
 import time
 import json
-import os
 import uuid
-import base64
-import re
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from datetime import datetime
-
-import openai
 from flask import Response, jsonify, render_template, request, stream_with_context, g
-from pydantic import ValidationError
 
 from ..core.config import (
     get_config_errors,
     get_models_response,
-    load_config,
     resolve_model_config,
-    get_logging_config,
-    get_responses_config,
 )
 from ..utils.http import error_response
-from ..utils.logging import get_file_logger, log_event, redact_payload
-from ..utils.token_count import count_messages_tokens, count_text_tokens
-from ..utils.local_store import LocalStore
-from ..utils.params import (
-    coerce_messages_for_chat,
-    extract_chat_params,
-    extract_chat_params_from_responses,
-    normalize_messages_from_input,
-)
-from .schemas import ChatCompletionsRequest, CompletionsRequest, EmbeddingsRequest, ResponsesRequest
-from ..services.openai_service import (
-    create_client,
-    create_chat_completion,
-    create_response,
-    stream_response,
-)
-from .streaming import stream_chat_sse, stream_responses_sse, stream_responses_sse_from_chat
-
-_local_store = None
-
-
-def _get_local_store(settings) -> LocalStore:
-    global _local_store
-    if _local_store is None:
-        base_dir = os.getenv("LOCAL_STORE_DIR", settings.log_dir)
-        _local_store = LocalStore(base_dir)
-    return _local_store
-
-
-def _get_default_model_id() -> str:
-    config = load_config()
-    return config.get("defaults", {}).get("model") or "unknown-model"
+from ..utils.logging import log_event
+from ..services.openai_service import create_client
+from .streaming import stream_openai_sse
 
 
 def _build_client(settings, base_url, api_key):
@@ -63,49 +24,6 @@ def _build_client(settings, base_url, api_key):
         timeout=settings.upstream_timeout,
         max_retries=settings.upstream_max_retries,
     )
-
-
-def _accepts_sse(req):
-    accept = (req.headers.get("Accept") or "").lower()
-    return "text/event-stream" in accept
-
-
-def _is_legacy_chat_style(req, payload_dict: dict | None = None) -> bool:
-    header_style = (req.headers.get("x-openai-style") or req.headers.get("x-openai-compat") or "").lower()
-    if header_style in {"old", "legacy", "compat", "text", "text_completion"}:
-        return True
-    if header_style in {"new", "chat", "v1"}:
-        return False
-    query_style = (req.args.get("openai_style") or req.args.get("openai_compat") or "").lower()
-    if query_style in {"old", "legacy", "compat", "text", "text_completion"}:
-        return True
-    if query_style in {"new", "chat", "v1"}:
-        return False
-    if isinstance(payload_dict, dict):
-        raw_style = payload_dict.get("oldApiStyle")
-        if raw_style is None:
-            raw_style = payload_dict.get("old_api_style")
-        if raw_style is None:
-            raw_style = payload_dict.get("api_style")
-        if raw_style is None:
-            raw_style = payload_dict.get("openai_style")
-        if isinstance(raw_style, bool):
-            return raw_style
-        if isinstance(raw_style, str):
-            normalized = raw_style.strip().lower()
-            if normalized in {"old", "legacy", "compat", "text", "text_completion", "true", "1", "yes"}:
-                return True
-            if normalized in {"new", "chat", "v1", "false", "0", "no"}:
-                return False
-    return False
-
-
-def _ordered_payload(payload: dict, key_order: list[str]) -> dict:
-    ordered = {key: payload[key] for key in key_order if key in payload}
-    for key, value in payload.items():
-        if key not in ordered:
-            ordered[key] = value
-    return ordered
 
 
 def _resolve_request_model(payload_dict):
@@ -122,49 +40,6 @@ def _resolve_request_model(payload_dict):
     g.resolved_provider = resolved.get("provider_name") or resolved.get("base_url")
     g.resolved_provider_url = resolved.get("base_url")
     return resolved, None
-
-
-def _make_response_id(prefix):
-    return f"{prefix}-{int(time.time() * 1000)}"
-
-
-def _extract_usage_dict(usage_obj):
-    if usage_obj is None:
-        return None
-    if hasattr(usage_obj, "model_dump"):
-        return usage_obj.model_dump()
-    if hasattr(usage_obj, "dict"):
-        return usage_obj.dict()
-    if isinstance(usage_obj, dict):
-        return usage_obj
-    return None
-
-
-def _log_upstream_error(
-    err: Exception,
-    request_id: str,
-    upstream_url: str,
-    payload: dict | None = None,
-):
-    response = getattr(err, "response", None)
-    status = getattr(err, "status_code", None) or getattr(response, "status_code", None)
-    body = None
-    if response is not None:
-        try:
-            body = response.text
-        except Exception:
-            body = None
-    if isinstance(body, str) and len(body) > 2000:
-        body = body[:2000] + "...(truncated)"
-    log_event(
-        40,
-        "upstream_error",
-        request_id=request_id,
-        upstream_url=upstream_url,
-        status=status,
-        body=body,
-        payload=payload,
-    )
 
 
 def _build_upstream_url(base_url: str, endpoint: str) -> str:
@@ -184,9 +59,10 @@ def _build_upstream_url_with_query(base_url: str, endpoint: str) -> str:
     return url
 
 
-def _build_multipart_body():
+def _build_multipart_body(overrides: dict | None = None):
     boundary = uuid.uuid4().hex
     body = bytearray()
+    overrides = overrides or {}
 
     def add_bytes(value: bytes):
         body.extend(value)
@@ -196,6 +72,8 @@ def _build_multipart_body():
         add_bytes(b"\r\n")
 
     for key, value in request.form.items(multi=True):
+        if key in overrides:
+            value = overrides[key]
         add_line(f"--{boundary}")
         add_line(f'Content-Disposition: form-data; name="{key}"')
         add_line()
@@ -266,473 +144,18 @@ def _forward_request(
     return response
 
 
-def _build_responses_payload(data: dict, resolved_model: str) -> dict:
-    allowed = {
-        "background",
-        "conversation",
-        "include",
-        "input",
-        "instructions",
-        "max_output_tokens",
-        "max_tool_calls",
-        "metadata",
-        "modalities",
-        "parallel_tool_calls",
-        "previous_response_id",
-        "prompt",
-        "prompt_cache_key",
-        "prompt_cache_retention",
-        "reasoning",
-        "response_format",
-        "safety_identifier",
-        "seed",
-        "service_tier",
-        "store",
-        "stream",
-        "temperature",
-        "text",
-        "tool_choice",
-        "tools",
-        "top_p",
-        "truncation",
-        "user",
-        "stop",
-    }
-    payload = {key: data[key] for key in data if key in allowed}
-    if "input" not in payload and isinstance(data.get("messages"), list):
-        payload["input"] = data["messages"]
-    if "text" not in payload and "response_format" in payload:
-        payload["text"] = {"format": payload["response_format"]}
-        payload.pop("response_format", None)
-    payload["model"] = resolved_model
-    return payload
-
-
-def _apply_instructions(messages, instructions):
-    if not instructions or not isinstance(instructions, str):
-        return messages
-    if not isinstance(messages, list):
-        return messages
-    for msg in messages:
-        if isinstance(msg, dict) and msg.get("role") == "system":
-            return messages
-    return [{"role": "system", "content": instructions}] + messages
+def _model_dump(obj):
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    if isinstance(obj, dict):
+        return obj
+    return obj
 
 
 def register_routes(app, settings):
     """Register Flask routes on the app."""
-    store = _get_local_store(settings)
-
-    def _list_response(items):
-        items_sorted = sorted(items, key=lambda item: item.get("created_at", 0), reverse=True)
-        first_id = items_sorted[0]["id"] if items_sorted else None
-        last_id = items_sorted[-1]["id"] if items_sorted else None
-        return jsonify(
-            {
-                "object": "list",
-                "data": items_sorted,
-                "first_id": first_id,
-                "last_id": last_id,
-                "has_more": False,
-            }
-        )
-
-    def _not_found(name: str, item_id: str):
-        return error_response(f"{name} '{item_id}' not found", 404, "invalid_request_error")
-
-    def _parse_completion_window_seconds(value) -> int | None:
-        if value is None:
-            return None
-        if isinstance(value, (int, float)):
-            return int(value)
-        text = str(value).strip().lower()
-        match = re.match(r"^(\d+)\s*([smhd])$", text)
-        if not match:
-            return None
-        amount = int(match.group(1))
-        unit = match.group(2)
-        if unit == "s":
-            return amount
-        if unit == "m":
-            return amount * 60
-        if unit == "h":
-            return amount * 3600
-        if unit == "d":
-            return amount * 86400
-        return None
-
-    def _calculate_expires_at(created_at: int | None, completion_window) -> int | None:
-        seconds = _parse_completion_window_seconds(completion_window)
-        if not seconds:
-            return None
-        base = created_at or int(time.time())
-        return base + seconds
-
-    def _normalize_assistant_data(payload, existing=None):
-        base = existing or {}
-        return {
-            "name": payload.get("name", base.get("name")),
-            "description": payload.get("description", base.get("description")),
-            "model": payload.get("model") or base.get("model") or _get_default_model_id(),
-            "instructions": payload.get("instructions", base.get("instructions")),
-            "tools": payload.get("tools", base.get("tools", [])) or [],
-            "tool_resources": payload.get("tool_resources", base.get("tool_resources", {})) or {},
-            "metadata": payload.get("metadata", base.get("metadata", {})) or {},
-            "top_p": payload.get("top_p", base.get("top_p", 1.0)),
-            "temperature": payload.get("temperature", base.get("temperature", 1.0)),
-            "response_format": payload.get("response_format", base.get("response_format", "auto")),
-        }
-
-    def _normalize_thread_data(payload, existing=None):
-        base = existing or {}
-        return {
-            "metadata": payload.get("metadata", base.get("metadata", {})) or {},
-            "tool_resources": payload.get("tool_resources", base.get("tool_resources", {})) or {},
-        }
-
-    def _normalize_message_content(content):
-        if content is None:
-            return []
-        if isinstance(content, list):
-            normalized = []
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    text = part.get("text") or {}
-                    if isinstance(text, str):
-                        text = {"value": text, "annotations": []}
-                    if "annotations" not in text:
-                        text["annotations"] = []
-                    normalized.append({"type": "text", "text": text})
-                elif isinstance(part, dict) and "text" in part and isinstance(part.get("text"), str):
-                    normalized.append({"type": "text", "text": {"value": part["text"], "annotations": []}})
-            return normalized
-        if isinstance(content, str):
-            return [{"type": "text", "text": {"value": content, "annotations": []}}]
-        return [{"type": "text", "text": {"value": json.dumps(content), "annotations": []}}]
-
-    def _normalize_message_data(payload, thread_id, run_id=None, assistant_id=None):
-        run_id = run_id or payload.get("run_id")
-        assistant_id = assistant_id or payload.get("assistant_id")
-        return {
-            "thread_id": thread_id,
-            "assistant_id": assistant_id,
-            "run_id": run_id,
-            "role": payload.get("role", "user"),
-            "content": _normalize_message_content(payload.get("content")),
-            "attachments": payload.get("attachments", []) or [],
-            "metadata": payload.get("metadata", {}) or {},
-            "status": "completed",
-            "incomplete_details": None,
-        }
-
-    def _normalize_run_data(payload, thread_id, assistant_id=None, existing=None):
-        base = existing or {}
-        created_at = base.get("created_at", int(time.time()))
-        status = payload.get("status", base.get("status", "queued"))
-        completed_at = payload["completed_at"] if "completed_at" in payload else base.get("completed_at")
-        cancelled_at = payload["cancelled_at"] if "cancelled_at" in payload else base.get("cancelled_at")
-        started_at = payload["started_at"] if "started_at" in payload else base.get("started_at", created_at)
-        if status == "completed" and completed_at is None:
-            completed_at = created_at
-        return {
-            "thread_id": thread_id,
-            "assistant_id": payload.get("assistant_id", assistant_id or base.get("assistant_id")),
-            "status": status,
-            "started_at": started_at,
-            "completed_at": completed_at,
-            "cancelled_at": cancelled_at,
-            "failed_at": payload.get("failed_at", base.get("failed_at")),
-            "expires_at": payload.get("expires_at", base.get("expires_at")),
-            "model": payload.get("model") or base.get("model") or _get_default_model_id(),
-            "instructions": payload.get("instructions", base.get("instructions")),
-            "tools": payload.get("tools", base.get("tools", [])),
-            "metadata": payload.get("metadata", base.get("metadata", {})) or {},
-            "response_format": payload.get("response_format", base.get("response_format", "auto")),
-            "tool_choice": payload.get("tool_choice", base.get("tool_choice", "auto")),
-            "parallel_tool_calls": payload.get(
-                "parallel_tool_calls",
-                base.get("parallel_tool_calls", True),
-            ),
-            "truncation_strategy": payload.get(
-                "truncation_strategy",
-                base.get("truncation_strategy", {"type": "auto", "last_messages": None}),
-            ),
-            "max_prompt_tokens": payload.get("max_prompt_tokens", base.get("max_prompt_tokens")),
-            "max_completion_tokens": payload.get("max_completion_tokens", base.get("max_completion_tokens")),
-            "temperature": payload.get("temperature", base.get("temperature")),
-            "top_p": payload.get("top_p", base.get("top_p")),
-            "incomplete_details": payload.get("incomplete_details", base.get("incomplete_details")),
-            "last_error": payload.get("last_error", base.get("last_error")),
-            "required_action": payload.get("required_action", base.get("required_action")),
-            "usage": payload.get("usage", base.get("usage")),
-        }
-
-    def _normalize_run_step_data(
-        thread_id,
-        run_id,
-        message_id,
-        assistant_id=None,
-        status: str = "completed",
-        usage: dict | None = None,
-    ):
-        now = int(time.time())
-        started_at = now if status in ("in_progress", "completed") else None
-        completed_at = now if status == "completed" else None
-        return {
-            "thread_id": thread_id,
-            "run_id": run_id,
-            "assistant_id": assistant_id,
-            "type": "message_creation",
-            "status": status,
-            "step_details": {"type": "message_creation", "message_creation": {"message_id": message_id}},
-            "last_error": None,
-            "usage": usage,
-            "started_at": started_at,
-            "completed_at": completed_at,
-        }
-
-    def _compute_run_usage(thread_id: str, run: dict) -> dict:
-        thread_messages = store.list_items("thread.message", parent_id=thread_id)
-        run_created_at = run.get("created_at", 0)
-        prompt_messages = [msg for msg in thread_messages if msg.get("created_at", 0) <= run_created_at]
-        completion_messages = [
-            msg for msg in thread_messages if msg.get("run_id") == run.get("id") and msg.get("role") == "assistant"
-        ]
-        model = run.get("model")
-        prompt_tokens = count_messages_tokens(prompt_messages, model=model)
-        completion_tokens = count_messages_tokens(completion_messages, model=model)
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
-
-    def _refresh_run_record(thread_id: str, run: dict) -> dict:
-        existing_status = run.get("status")
-        if existing_status in ("cancelled", "failed", "expired", "requires_action"):
-            return run
-        usage = _compute_run_usage(thread_id, run)
-        thread_messages = store.list_items("thread.message", parent_id=thread_id)
-        completion_messages = [
-            msg for msg in thread_messages if msg.get("run_id") == run.get("id") and msg.get("role") == "assistant"
-        ]
-        has_activity = bool(completion_messages)
-        has_output = count_messages_tokens(completion_messages, model=run.get("model")) > 0
-        completed_at = run.get("completed_at")
-        started_at = run.get("started_at")
-        status = existing_status or "queued"
-        if has_output:
-            status = "completed"
-            if not completed_at:
-                latest_completion = max((msg.get("created_at", 0) for msg in completion_messages), default=0)
-                completed_at = latest_completion or int(time.time())
-            if not started_at:
-                started_at = run.get("created_at")
-        else:
-            if has_activity:
-                status = "in_progress"
-                if not started_at:
-                    started_at = run.get("created_at")
-            else:
-                if status not in ("queued", "in_progress"):
-                    status = "queued"
-                if status == "in_progress" and not started_at:
-                    started_at = run.get("created_at")
-                if status == "queued":
-                    started_at = None
-
-        updates = _normalize_run_data(
-            {
-                "status": status,
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "usage": usage,
-            },
-            thread_id,
-            run.get("assistant_id"),
-            run,
-        )
-        updated = store.update_item("thread.run", run["id"], updates)
-        return updated or run
-
-    def _refresh_run_step_record(thread_id: str, step: dict) -> dict:
-        run_id = step.get("run_id")
-        if not run_id:
-            return step
-        run = store.get_item("thread.run", run_id)
-        if not run:
-            return step
-        if step.get("status") in ("cancelled", "failed", "expired"):
-            return step
-        message_id = (
-            (step.get("step_details") or {}).get("message_creation", {}).get("message_id")
-        )
-        message = store.get_item("thread.message", message_id) if message_id else None
-        prompt_messages = [
-            msg
-            for msg in store.list_items("thread.message", parent_id=thread_id)
-            if msg.get("created_at", 0) <= run.get("created_at", 0)
-        ]
-        prompt_tokens = count_messages_tokens(prompt_messages, model=run.get("model"))
-        completion_tokens = count_messages_tokens([message], model=run.get("model")) if message else 0
-        status = "completed" if completion_tokens > 0 else "in_progress"
-        updates = {
-            "status": status,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            },
-            "started_at": step.get("started_at") or run.get("started_at") or run.get("created_at") or int(time.time()),
-            "completed_at": step.get("completed_at"),
-        }
-        if status == "completed" and updates["completed_at"] is None:
-            updates["completed_at"] = message.get("created_at") if message else int(time.time())
-        updated = store.update_item("thread.run.step", step["id"], updates)
-        return updated or step
-
-    def _extract_response_output_text(output) -> str:
-        if isinstance(output, str):
-            return output
-        if isinstance(output, list):
-            parts: list[str] = []
-            for item in output:
-                if isinstance(item, dict):
-                    if isinstance(item.get("output_text"), str):
-                        parts.append(item.get("output_text"))
-                    content = item.get("content")
-                    if isinstance(content, str):
-                        parts.append(content)
-                    if isinstance(content, list):
-                        for piece in content:
-                            if not isinstance(piece, dict):
-                                continue
-                            if piece.get("type") in ("output_text", "text"):
-                                text = piece.get("text")
-                                if isinstance(text, dict):
-                                    parts.append(str(text.get("value") or text.get("text") or ""))
-                                else:
-                                    parts.append(str(text or ""))
-                elif isinstance(item, str):
-                    parts.append(item)
-            return "".join(parts)
-        return ""
-
-    def _strip_upload_part_payload(item: dict) -> dict:
-        if not isinstance(item, dict):
-            return item
-        sanitized = dict(item)
-        sanitized.pop("data_b64", None)
-        sanitized.pop("path", None)
-        sanitized.pop("sha256", None)
-        return sanitized
-
-    def _normalize_upload_part_object(item: dict) -> dict:
-        if not isinstance(item, dict):
-            return item
-        if item.get("object") == "upload.part":
-            return item
-        normalized = dict(item)
-        normalized["object"] = "upload.part"
-        return normalized
-
-    def _normalize_vector_store_data(payload, existing=None):
-        base = existing or {}
-        return {
-            "name": payload.get("name", base.get("name")),
-            "status": "completed",
-            "usage_bytes": payload.get("usage_bytes", base.get("usage_bytes", 0)) or 0,
-            "file_counts": payload.get(
-                "file_counts",
-                base.get(
-                    "file_counts",
-                    {"in_progress": 0, "completed": 0, "failed": 0, "cancelled": 0, "total": 0},
-                ),
-            ),
-            "last_active_at": payload.get("last_active_at", base.get("last_active_at")),
-            "last_used_at": payload.get("last_used_at", base.get("last_used_at")),
-            "expires_after": payload.get("expires_after", base.get("expires_after")),
-            "expires_at": payload.get("expires_at", base.get("expires_at")),
-            "metadata": payload.get("metadata", base.get("metadata", {})) or {},
-        }
-
-    def _normalize_vector_store_file_data(vector_store_id, file_id):
-        return {
-            "vector_store_id": vector_store_id,
-            "file_id": file_id,
-            "status": "completed",
-            "last_error": None,
-        }
-
-    def _normalize_file_data(payload, existing=None):
-        base = existing or {}
-        return {
-            "bytes": payload.get("bytes", base.get("bytes", 0)) or 0,
-            "filename": payload.get("filename", base.get("filename")),
-            "purpose": payload.get("purpose", base.get("purpose")),
-            "status": payload.get("status", base.get("status", "processed")),
-            "status_details": payload.get("status_details", base.get("status_details")),
-            "expires_at": payload.get("expires_at", base.get("expires_at")),
-        }
-
-    def _normalize_upload_data(payload, existing=None):
-        base = existing or {}
-        created_at = base.get("created_at")
-        expires_at = payload.get("expires_at", base.get("expires_at"))
-        if expires_at is None:
-            expires_at = _calculate_expires_at(created_at, payload.get("completion_window") or "1h")
-        return {
-            "bytes": payload.get("bytes", base.get("bytes", 0)) or 0,
-            "filename": payload.get("filename", base.get("filename")),
-            "purpose": payload.get("purpose", base.get("purpose")),
-            "status": payload.get("status", base.get("status", "pending")),
-            "expires_at": expires_at,
-            "mime_type": payload.get("mime_type", base.get("mime_type")),
-            "file_id": payload.get("file_id", base.get("file_id")),
-        }
-
-    def _normalize_batch_data(payload, existing=None):
-        base = existing or {}
-        created_at = base.get("created_at")
-        status = payload.get("status", base.get("status", "validating"))
-        expires_at = payload.get("expires_at", base.get("expires_at"))
-        if expires_at is None:
-            expires_at = _calculate_expires_at(created_at, payload.get("completion_window") or base.get("completion_window"))
-        now = int(time.time())
-        in_progress_at = payload.get("in_progress_at", base.get("in_progress_at"))
-        finalizing_at = payload.get("finalizing_at", base.get("finalizing_at"))
-        completed_at = payload.get("completed_at", base.get("completed_at"))
-        failed_at = payload.get("failed_at", base.get("failed_at"))
-        cancelled_at = payload.get("cancelled_at", base.get("cancelled_at"))
-        if status == "in_progress" and in_progress_at is None:
-            in_progress_at = now
-        if status == "finalizing" and finalizing_at is None:
-            finalizing_at = now
-        if status == "completed" and completed_at is None:
-            completed_at = now
-        if status == "failed" and failed_at is None:
-            failed_at = now
-        if status == "cancelled" and cancelled_at is None:
-            cancelled_at = now
-        base_counts = base.get("request_counts") or {"total": 0, "completed": 0, "failed": 0}
-        payload_counts = payload.get("request_counts") or {}
-        merged_counts = {**base_counts, **payload_counts}
-        return {
-            "endpoint": payload.get("endpoint", base.get("endpoint")),
-            "input_file_id": payload.get("input_file_id", base.get("input_file_id")),
-            "completion_window": payload.get("completion_window", base.get("completion_window", "24h")),
-            "status": status,
-            "output_file_id": payload.get("output_file_id", base.get("output_file_id")),
-            "error_file_id": payload.get("error_file_id", base.get("error_file_id")),
-            "request_counts": merged_counts,
-            "metadata": payload.get("metadata", base.get("metadata", {})) or {},
-            "in_progress_at": in_progress_at,
-            "expires_at": expires_at,
-            "finalizing_at": finalizing_at,
-            "completed_at": completed_at,
-            "failed_at": failed_at,
-            "cancelled_at": cancelled_at,
-        }
 
     @app.route('/', methods=['GET'])
     def index():
@@ -745,160 +168,36 @@ def register_routes(app, settings):
             data = request.get_json(silent=True) or {}
             if "model" not in data and "modelId" in data:
                 data["model"] = data["modelId"]
-            try:
-                payload = CompletionsRequest.model_validate(data)
-            except ValidationError as e:
-                return error_response(str(e), 400, "invalid_request_error")
-            payload_dict = payload.model_dump(exclude_none=True)
-            prompt = payload.prompt
-            if prompt is None:
-                return error_response("No prompt provided", 400, "invalid_request_error")
-            if isinstance(prompt, list):
-                prompt_text = "\n".join(str(item) for item in prompt if item is not None)
-            elif isinstance(prompt, str):
-                prompt_text = prompt
-            else:
-                return error_response("Invalid prompt", 400, "invalid_request_error")
-            resolved, error_message = _resolve_request_model(payload_dict)
+            resolved, error_message = _resolve_request_model(data)
             if error_message:
                 return error_response(error_message, 400)
-            params = extract_chat_params(payload_dict)
-            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
-
-            if payload.stream:
-                return error_response(
-                    "Streaming not supported for /v1/completions; use /v1/chat/completions",
-                    400,
-                    "invalid_request_error",
-                )
-
-            log_cfg = get_logging_config()
-            upstream_payload = redact_payload(
-                {
-                    "model": resolved["model"],
-                    "messages": [{"role": "user", "content": prompt_text}],
-                    **params,
-                },
-                log_cfg.get("redact_keys", []),
-            )
-            if log_cfg.get("include_body"):
-                try:
-                    log_event(
-                        20,
-                        "upstream_request",
-                        request_id=g.request_id,
-                        provider=resolved.get("provider_name") or resolved.get("base_url"),
-                        upstream_url=g.upstream_url,
-                        payload=upstream_payload,
-                    )
-                except Exception as e:
-                    log_event(40, "upstream_log_failed", error=str(e))
-
+            payload = dict(data)
+            payload["model"] = resolved["model"]
+            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "completions")
             client = _build_client(settings, resolved["base_url"], resolved["api_key"])
-            try:
-                response_obj = create_chat_completion(
-                    client,
-                    resolved["model"],
-                    [{"role": "user", "content": prompt_text}],
-                    **params,
-                )
-            except openai.RateLimitError as e:
-                return error_response(str(e), 429, "rate_limit_error")
-            except openai.APIConnectionError as e:
-                return error_response(str(e), 502, "api_connection_error")
-            except openai.APIStatusError as e:
-                _log_upstream_error(e, g.request_id, g.upstream_url, payload=upstream_payload)
-                status = getattr(e, "status_code", 502) or 502
-                return error_response(str(e), status, "api_error")
-            except Exception as e:
-                return error_response(str(e), 500, "internal_error")
-
-            raw_choices = getattr(response_obj, "choices", None) or []
-            choices_payload = []
-            content = ""
-            finish_reason = None
-            for idx, choice in enumerate(raw_choices):
-                choice_dict = None
-                if hasattr(choice, "model_dump"):
-                    choice_dict = choice.model_dump(exclude_none=True)
-                elif hasattr(choice, "dict"):
-                    choice_dict = choice.dict()
-                elif isinstance(choice, dict):
-                    choice_dict = dict(choice)
-                if choice_dict is None:
-                    continue
-                choice_index = choice_dict.get("index", idx)
-                choice_finish = choice_dict.get("finish_reason")
-                choice_logprobs = choice_dict.get("logprobs")
-                message = choice_dict.get("message")
-                if hasattr(message, "model_dump"):
-                    message = message.model_dump(exclude_none=True)
-                elif hasattr(message, "dict"):
-                    message = message.dict()
-                text_value = None
-                if isinstance(message, dict):
-                    text_value = message.get("content")
-                else:
-                    text_value = getattr(message, "content", None)
-                if text_value is None:
-                    text_value = choice_dict.get("text") or ""
-                if not content and isinstance(text_value, str):
-                    content = text_value
-                if finish_reason is None:
-                    finish_reason = choice_finish
-                choice_payload = {
-                    "index": choice_index,
-                    "text": text_value or "",
-                    "finish_reason": choice_finish or "stop",
-                }
-                if choice_logprobs is not None:
-                    choice_payload["logprobs"] = choice_logprobs
-                choices_payload.append(
-                    _ordered_payload(
-                        choice_payload,
-                        ["index", "text", "finish_reason", "logprobs"],
+            if payload.get("stream"):
+                if not hasattr(client.completions, "with_streaming_response") or not hasattr(client.completions, "with_raw_response"):
+                    stream = client.completions.create(**payload)
+                    return Response(
+                        stream_with_context(
+                            stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url)
+                        ),
+                        mimetype='text/event-stream',
                     )
+                stream = client.completions.with_streaming_response.create(**payload)
+                return Response(
+                    stream_with_context(
+                        stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url, raw_response=True)
+                    ),
+                    mimetype='text/event-stream',
                 )
-            if not choices_payload:
-                fallback_count = 1
-                raw_n = data.get("n") if isinstance(data, dict) else None
-                if isinstance(raw_n, int) and raw_n > 1:
-                    fallback_count = raw_n
-                choices_payload = [
-                    _ordered_payload(
-                        {
-                            "index": idx,
-                            "text": content or "",
-                            "finish_reason": finish_reason or "stop",
-                            "logprobs": None,
-                        },
-                        ["index", "text", "finish_reason", "logprobs"],
-                    )
-                    for idx in range(fallback_count)
-                ]
-            usage = _extract_usage_dict(getattr(response_obj, "usage", None))
-            if usage is None:
-                prompt_tokens = count_text_tokens(prompt_text, model=resolved["model"])
-                completion_tokens = count_text_tokens(content, model=resolved["model"])
-                usage = {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": prompt_tokens + completion_tokens,
-                }
-            response_payload = {
-                "id": getattr(response_obj, "id", None) or _make_response_id("cmpl"),
-                "object": "text_completion",
-                "created": getattr(response_obj, "created", None) or int(time.time()),
-                "model": resolved["id"],
-                "choices": choices_payload,
-                "usage": usage,
-            }
-            response_payload = _ordered_payload(
-                response_payload,
-                ["id", "object", "created", "model", "choices", "usage"],
-            )
-            return jsonify(response_payload)
-
+            if not hasattr(client.completions, "with_raw_response"):
+                response_obj = client.completions.create(**payload)
+                return jsonify(_model_dump(response_obj))
+            response_obj = client.completions.with_raw_response.create(**payload)
+            if hasattr(response_obj, "parse"):
+                return jsonify(_model_dump(response_obj.parse()))
+            return jsonify(_model_dump(response_obj))
         except Exception as e:
             log_event(40, "completions_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
@@ -910,291 +209,36 @@ def register_routes(app, settings):
             data = request.get_json(silent=True) or {}
             if "model" not in data and "modelId" in data:
                 data["model"] = data["modelId"]
-            try:
-                payload = ChatCompletionsRequest.model_validate(data)
-            except ValidationError as e:
-                return error_response(str(e), 400, "invalid_request_error")
-            payload_dict = payload.model_dump(exclude_none=True)
-            messages = [msg.model_dump(exclude_none=True) for msg in payload.messages]
-            messages = coerce_messages_for_chat(messages)
-            stream = payload.stream
-            if stream and not _accepts_sse(request):
-                stream = False
-            legacy_style = _is_legacy_chat_style(request, data)
-            params = extract_chat_params(payload_dict)
-            resolved, error_message = _resolve_request_model(payload_dict)
+            resolved, error_message = _resolve_request_model(data)
             if error_message:
                 return error_response(error_message, 400)
-            if not messages:
-                return error_response("No messages provided", 400)
+            payload = dict(data)
+            payload["model"] = resolved["model"]
             g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
-
-            if settings.create_log:
-                try:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    file_logger = get_file_logger(settings.log_dir)
-                    payload = "\n".join(
-                        [
-                            f"=== {timestamp} ===",
-                            f"Model: {resolved['id']}",
-                            f"ProviderModel: {resolved['model']}",
-                            f"BaseUrl: {resolved['base_url']}",
-                            f"IP: {request.remote_addr}",
-                            json.dumps(data, indent=2, ensure_ascii=False),
-                            "",
-                        ]
-                    )
-                    file_logger.info(payload)
-                except Exception as e:
-                    log_event(40, "file_logging_failed", error=str(e))
-
-            log_cfg = get_logging_config()
-            upstream_payload = redact_payload(
-                {"model": resolved["model"], "messages": messages, **params},
-                log_cfg.get("redact_keys", []),
-            )
-            if log_cfg.get("include_body"):
-                try:
-                    log_event(
-                        20,
-                        "upstream_request",
-                        request_id=g.request_id,
-                        provider=resolved.get("provider_name") or resolved.get("base_url"),
-                        upstream_url=g.upstream_url,
-                        payload=upstream_payload,
-                    )
-                except Exception as e:
-                    log_event(40, "upstream_log_failed", error=str(e))
-
             client = _build_client(settings, resolved["base_url"], resolved["api_key"])
-            if stream:
-                response_id = _make_response_id("cmpl" if legacy_style else "chatcmpl")
-                created = int(time.time())
+            if payload.get("stream"):
+                if not hasattr(client.chat.completions, "with_streaming_response") or not hasattr(client.chat.completions, "with_raw_response"):
+                    stream = client.chat.completions.create(**payload)
+                    return Response(
+                        stream_with_context(
+                            stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url)
+                        ),
+                        mimetype='text/event-stream',
+                    )
+                stream = client.chat.completions.with_streaming_response.create(**payload)
                 return Response(
                     stream_with_context(
-                        stream_chat_sse(
-                            client,
-                            resolved["model"],
-                            messages,
-                            resolved["id"],
-                            response_id,
-                            created,
-                            legacy=legacy_style,
-                            **params,
-                        )
+                        stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url, raw_response=True)
                     ),
                     mimetype='text/event-stream',
                 )
-
-            try:
-                response_obj = create_chat_completion(client, resolved["model"], messages, **params)
-            except openai.RateLimitError as e:
-                return error_response(str(e), 429, "rate_limit_error")
-            except openai.APIConnectionError as e:
-                return error_response(str(e), 502, "api_connection_error")
-            except openai.APIStatusError as e:
-                _log_upstream_error(e, g.request_id, g.upstream_url, payload=upstream_payload)
-                status = getattr(e, "status_code", 502) or 502
-                return error_response(str(e), status, "api_error")
-            except Exception as e:
-                return error_response(str(e), 500, "internal_error")
-
-            response_payload = None
-            if hasattr(response_obj, "model_dump"):
-                response_payload = response_obj.model_dump()
-            elif hasattr(response_obj, "dict"):
-                response_payload = response_obj.dict()
-            elif isinstance(response_obj, dict):
-                response_payload = response_obj
-            choices_raw = []
-            if isinstance(response_payload, dict):
-                raw_choices = response_payload.get("choices")
-                if isinstance(raw_choices, list):
-                    choices_raw = raw_choices
-            if not choices_raw:
-                choices_raw = getattr(response_obj, "choices", None) or []
-
-            content = ""
-            finish_reason = None
-            if choices_raw:
-                first_choice = choices_raw[0]
-                if hasattr(first_choice, "model_dump"):
-                    first_choice = first_choice.model_dump(exclude_none=True)
-                elif hasattr(first_choice, "dict"):
-                    first_choice = first_choice.dict()
-                message = None
-                if isinstance(first_choice, dict):
-                    message = first_choice.get("message")
-                    finish_reason = first_choice.get("finish_reason")
-                    if message is None:
-                        content = first_choice.get("text") or ""
-                else:
-                    message = getattr(first_choice, "message", None)
-                    finish_reason = getattr(first_choice, "finish_reason", None)
-                if message is not None:
-                    if hasattr(message, "model_dump"):
-                        message = message.model_dump(exclude_none=True)
-                    elif hasattr(message, "dict"):
-                        message = message.dict()
-                    if isinstance(message, dict):
-                        content = message.get("content") or content
-                    else:
-                        content = getattr(message, "content", None) or content
-
-            usage = _extract_usage_dict(
-                response_payload.get("usage") if isinstance(response_payload, dict) else getattr(response_obj, "usage", None)
-            )
-            if usage is None:
-                prompt_tokens = count_messages_tokens(messages, model=resolved["model"])
-                completion_tokens = count_text_tokens(content, model=resolved["model"])
-                if legacy_style:
-                    usage = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens,
-                    }
-                else:
-                    usage = {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens,
-                        "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
-                        "completion_tokens_details": {
-                            "reasoning_tokens": 0,
-                            "audio_tokens": 0,
-                            "accepted_prediction_tokens": 0,
-                            "rejected_prediction_tokens": 0,
-                        },
-                    }
-
-            choices = []
-            for idx, choice in enumerate(choices_raw):
-                choice_dict = None
-                if hasattr(choice, "model_dump"):
-                    choice_dict = choice.model_dump(exclude_none=True)
-                elif hasattr(choice, "dict"):
-                    choice_dict = choice.dict()
-                elif isinstance(choice, dict):
-                    choice_dict = dict(choice)
-                if choice_dict is None:
-                    continue
-                choice_index = choice_dict.get("index", idx)
-                choice_finish = choice_dict.get("finish_reason", finish_reason)
-                choice_logprobs = choice_dict.get("logprobs")
-                if legacy_style:
-                    text_value = choice_dict.get("text")
-                    if text_value is None:
-                        message = choice_dict.get("message")
-                        if hasattr(message, "model_dump"):
-                            message = message.model_dump(exclude_none=True)
-                        elif hasattr(message, "dict"):
-                            message = message.dict()
-                        if isinstance(message, dict):
-                            text_value = message.get("content")
-                    if choice_finish == "tool_calls":
-                        choice_finish = "stop"
-                    choice_payload = {
-                        "index": choice_index,
-                        "text": text_value or "",
-                        "finish_reason": choice_finish or "stop",
-                    }
-                    if choice_logprobs is not None:
-                        choice_payload["logprobs"] = choice_logprobs
-                    choices.append(
-                        _ordered_payload(
-                            choice_payload,
-                            ["index", "text", "finish_reason", "logprobs"],
-                        )
-                    )
-                else:
-                    message = choice_dict.get("message")
-                    if hasattr(message, "model_dump"):
-                        message = message.model_dump(exclude_none=True)
-                    elif hasattr(message, "dict"):
-                        message = message.dict()
-                    if not isinstance(message, dict):
-                        text_value = choice_dict.get("text") or ""
-                        message = {"role": "assistant", "content": text_value}
-                    elif "role" not in message:
-                        message["role"] = "assistant"
-                    if isinstance(message, dict):
-                        message = _ordered_payload(
-                            message,
-                            ["role", "content", "tool_calls", "function_call", "name"],
-                        )
-                    choice_payload = {
-                        "index": choice_index,
-                        "message": message,
-                        "finish_reason": choice_finish or "stop",
-                    }
-                    if choice_logprobs is not None:
-                        choice_payload["logprobs"] = choice_logprobs
-                    choices.append(
-                        _ordered_payload(
-                            choice_payload,
-                            ["index", "message", "finish_reason", "logprobs"],
-                        )
-                    )
-
-            if not choices:
-                fallback_count = 1
-                raw_n = payload_dict.get("n")
-                if not isinstance(raw_n, int):
-                    raw_n = data.get("n") if isinstance(data, dict) else None
-                if isinstance(raw_n, int) and raw_n > 1:
-                    fallback_count = raw_n
-                if legacy_style:
-                    choices = [
-                        _ordered_payload(
-                            {
-                                "index": idx,
-                                "text": content or "",
-                                "finish_reason": finish_reason or "stop",
-                            },
-                            ["index", "text", "finish_reason"],
-                        )
-                        for idx in range(fallback_count)
-                    ]
-                else:
-                    choices = [
-                        _ordered_payload(
-                            {
-                                "index": idx,
-                                "message": _ordered_payload(
-                                    {"role": "assistant", "content": content or ""},
-                                    ["role", "content"],
-                                ),
-                                "finish_reason": finish_reason or "stop",
-                            },
-                            ["index", "message", "finish_reason"],
-                        )
-                        for idx in range(fallback_count)
-                    ]
-
-            response_id = None
-            response_created = None
-            if isinstance(response_payload, dict):
-                response_id = response_payload.get("id")
-                response_created = response_payload.get("created")
-            if response_id is None:
-                response_id = getattr(response_obj, "id", None)
-            if response_created is None:
-                response_created = getattr(response_obj, "created", None)
-
-            response_payload = {
-                "id": response_id or _make_response_id("cmpl" if legacy_style else "chatcmpl"),
-                "object": "text_completion" if legacy_style else "chat.completion",
-                "created": response_created or int(time.time()),
-                "model": resolved["id"],
-                "choices": choices,
-                "usage": usage,
-            }
-            response_payload = _ordered_payload(
-                response_payload,
-                ["id", "object", "created", "model", "choices", "usage"],
-            )
-            return jsonify(response_payload)
-
+            if not hasattr(client.chat.completions, "with_raw_response"):
+                response_obj = client.chat.completions.create(**payload)
+                return jsonify(_model_dump(response_obj))
+            response_obj = client.chat.completions.with_raw_response.create(**payload)
+            if hasattr(response_obj, "parse"):
+                return jsonify(_model_dump(response_obj.parse()))
+            return jsonify(_model_dump(response_obj))
         except Exception as e:
             log_event(40, "chat_completions_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
@@ -1206,310 +250,36 @@ def register_routes(app, settings):
             data = request.get_json(silent=True) or {}
             if "model" not in data and "modelId" in data:
                 data["model"] = data["modelId"]
-            try:
-                payload = ResponsesRequest.model_validate(data)
-            except ValidationError as e:
-                return error_response(str(e), 400, "invalid_request_error")
-            payload_dict = payload.model_dump(exclude_none=True)
-            stream = payload.stream
-            if stream and not _accepts_sse(request):
-                stream = False
-            resolved, error_message = _resolve_request_model(payload_dict)
+            resolved, error_message = _resolve_request_model(data)
             if error_message:
                 return error_response(error_message, 400)
-            responses_cfg = get_responses_config()
-            model_responses = resolved.get("responses", {}) if isinstance(resolved, dict) else {}
-            provider_responses = resolved.get("provider_responses", {}) if isinstance(resolved, dict) else {}
-            mode = (
-                (model_responses or {}).get("mode")
-                or (provider_responses or {}).get("mode")
-                or responses_cfg.get("mode", "auto")
-            )
-
-            if mode == "chat":
-                fallback_messages = normalize_messages_from_input(payload_dict)
-                fallback_messages = _apply_instructions(
-                    fallback_messages,
-                    payload_dict.get("instructions") or payload_dict.get("system"),
-                )
-                fallback_messages = coerce_messages_for_chat(fallback_messages)
-                if not fallback_messages:
-                    return error_response("No input provided", 400, "invalid_request_error")
-                fallback_params = extract_chat_params_from_responses(payload_dict)
-                g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
-
-                log_cfg = get_logging_config()
-                fallback_payload = redact_payload(
-                    {"model": resolved["model"], "messages": fallback_messages, **fallback_params},
-                    log_cfg.get("redact_keys", []),
-                )
-                if log_cfg.get("include_body"):
-                    try:
-                        log_event(
-                            20,
-                            "upstream_request",
-                            request_id=g.request_id,
-                            provider=resolved.get("provider_name") or resolved.get("base_url"),
-                            upstream_url=g.upstream_url,
-                            payload=fallback_payload,
-                        )
-                    except Exception as e:
-                        log_event(40, "upstream_log_failed", error=str(e))
-
-                client = _build_client(settings, resolved["base_url"], resolved["api_key"])
-                if stream:
-                    response_id = _make_response_id("resp")
-                    created = int(time.time())
+            payload = dict(data)
+            payload["model"] = resolved["model"]
+            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "responses")
+            client = _build_client(settings, resolved["base_url"], resolved["api_key"])
+            if payload.get("stream"):
+                if not hasattr(client.responses, "with_streaming_response") or not hasattr(client.responses, "with_raw_response"):
+                    stream = client.responses.create(**payload)
                     return Response(
                         stream_with_context(
-                            stream_responses_sse_from_chat(
-                                client,
-                                resolved["model"],
-                                fallback_messages,
-                                resolved["id"],
-                                response_id,
-                                created,
-                                request_id=g.request_id,
-                                upstream_url=g.upstream_url,
-                                **fallback_params,
-                            )
+                            stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url)
                         ),
                         mimetype='text/event-stream',
                     )
-                try:
-                    response_obj = create_chat_completion(client, resolved["model"], fallback_messages, **fallback_params)
-                except openai.RateLimitError as e:
-                    return error_response(str(e), 429, "rate_limit_error")
-                except openai.APIConnectionError as e:
-                    return error_response(str(e), 502, "api_connection_error")
-                except openai.APIStatusError as e:
-                    _log_upstream_error(e, g.request_id, g.upstream_url, payload=fallback_payload)
-                    status = getattr(e, "status_code", 502) or 502
-                    return error_response(str(e), status, "api_error")
-                except Exception as e:
-                    return error_response(str(e), 500, "internal_error")
-                choices = getattr(response_obj, "choices", None) or []
-                message = getattr(choices[0], "message", None) if choices else None
-                content = getattr(message, "content", None) if message else ""
-                usage = _extract_usage_dict(getattr(response_obj, "usage", None))
-                if usage is None:
-                    input_tokens = count_messages_tokens(fallback_messages, model=resolved["model"])
-                    output_tokens = count_text_tokens(content, model=resolved["model"])
-                    usage = {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                    }
-                response_payload = {
-                    "id": _make_response_id("resp"),
-                    "object": "response",
-                    "created_at": int(time.time()),
-                    "model": resolved["id"],
-                    "status": "completed",
-                    "output": [
-                        {
-                            "id": _make_response_id("msg"),
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": content, "annotations": []}],
-                        }
-                    ],
-                    "usage": usage,
-                }
-                response_payload = _ordered_payload(
-                    response_payload,
-                    ["id", "object", "created_at", "model", "status", "output", "usage"],
+                stream = client.responses.with_streaming_response.create(**payload)
+                return Response(
+                    stream_with_context(
+                        stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url, raw_response=True)
+                    ),
+                    mimetype='text/event-stream',
                 )
-                return jsonify(response_payload)
-            responses_payload = _build_responses_payload(data, resolved["model"])
-            if "input" not in responses_payload:
-                return error_response("No input provided", 400)
-            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "responses")
-
-            log_cfg = get_logging_config()
-            upstream_payload = redact_payload(responses_payload, log_cfg.get("redact_keys", []))
-            if log_cfg.get("include_body"):
-                try:
-                    log_event(
-                        20,
-                        "upstream_request",
-                        request_id=g.request_id,
-                        provider=resolved.get("provider_name") or resolved.get("base_url"),
-                        upstream_url=g.upstream_url,
-                        payload=upstream_payload,
-                    )
-                except Exception as e:
-                    log_event(40, "upstream_log_failed", error=str(e))
-
-            client = _build_client(settings, resolved["base_url"], resolved["api_key"])
-            if stream:
-                responses_payload.pop("stream", None)
-                def response_stream():
-                    try:
-                        stream_iter = stream_response(client, **responses_payload)
-                        for chunk in stream_responses_sse(
-                            stream_iter,
-                            request_id=g.request_id,
-                            upstream_url=g.upstream_url,
-                            request_payload=upstream_payload,
-                        ):
-                            yield chunk
-                    except openai.NotFoundError:
-                        # Provider doesn't support /responses; fall back to chat.completions.
-                        if mode != "auto":
-                            yield 'event: response.failed\n'
-                            yield 'data: {"type":"response.failed","error":{"message":"Responses API not supported by provider","type":"api_error"}}\n\n'
-                            return
-                        fallback_messages = normalize_messages_from_input(payload_dict)
-                        fallback_messages = _apply_instructions(
-                            fallback_messages,
-                            payload_dict.get("instructions") or payload_dict.get("system"),
-                        )
-                        fallback_messages = coerce_messages_for_chat(fallback_messages)
-                        if not fallback_messages:
-                            yield 'event: response.failed\n'
-                            yield 'data: {"type":"response.failed","error":{"message":"No input provided","type":"invalid_request_error"}}\n\n'
-                            return
-                        fallback_params = extract_chat_params_from_responses(payload_dict)
-                        g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
-                        fallback_payload = redact_payload(
-                            {"model": resolved["model"], "messages": fallback_messages, **fallback_params},
-                            log_cfg.get("redact_keys", []),
-                        )
-                        log_event(
-                            20,
-                            "responses_fallback",
-                            request_id=g.request_id,
-                            provider=resolved.get("provider_name") or resolved.get("base_url"),
-                            upstream_url=g.upstream_url,
-                            reason="responses_not_supported",
-                        )
-                        response_id = _make_response_id("resp")
-                        created = int(time.time())
-                        for chunk in stream_responses_sse_from_chat(
-                            client,
-                            resolved["model"],
-                            fallback_messages,
-                            resolved["id"],
-                            response_id,
-                            created,
-                            request_id=g.request_id,
-                            upstream_url=g.upstream_url,
-                            request_payload=fallback_payload,
-                            **fallback_params,
-                        ):
-                            yield chunk
-
-                return Response(stream_with_context(response_stream()), mimetype='text/event-stream')
-
-            try:
-                response_obj = create_response(client, **responses_payload)
-            except openai.NotFoundError:
-                # Provider doesn't support /responses; fall back to chat.completions.
-                if mode != "auto":
-                    return error_response("Responses API not supported by provider", 502, "api_error")
-                fallback_messages = normalize_messages_from_input(payload_dict)
-                fallback_messages = _apply_instructions(
-                    fallback_messages,
-                    payload_dict.get("instructions") or payload_dict.get("system"),
-                )
-                fallback_messages = coerce_messages_for_chat(fallback_messages)
-                if not fallback_messages:
-                    return error_response("No input provided", 400, "invalid_request_error")
-                fallback_params = extract_chat_params_from_responses(payload_dict)
-                g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
-                fallback_payload = redact_payload(
-                    {"model": resolved["model"], "messages": fallback_messages, **fallback_params},
-                    log_cfg.get("redact_keys", []),
-                )
-                log_event(
-                    20,
-                    "responses_fallback",
-                    request_id=g.request_id,
-                    provider=resolved.get("provider_name") or resolved.get("base_url"),
-                    upstream_url=g.upstream_url,
-                    reason="responses_not_supported",
-                )
-                try:
-                    response_obj = create_chat_completion(client, resolved["model"], fallback_messages, **fallback_params)
-                except openai.RateLimitError as e:
-                    return error_response(str(e), 429, "rate_limit_error")
-                except openai.APIConnectionError as e:
-                    return error_response(str(e), 502, "api_connection_error")
-                except openai.APIStatusError as e:
-                    _log_upstream_error(e, g.request_id, g.upstream_url, payload=fallback_payload)
-                    status = getattr(e, "status_code", 502) or 502
-                    return error_response(str(e), status, "api_error")
-                except Exception as e:
-                    return error_response(str(e), 500, "internal_error")
-                choices = getattr(response_obj, "choices", None) or []
-                message = getattr(choices[0], "message", None) if choices else None
-                content = getattr(message, "content", None) if message else ""
-                usage = _extract_usage_dict(getattr(response_obj, "usage", None))
-                if usage is None:
-                    input_tokens = count_messages_tokens(fallback_messages, model=resolved["model"])
-                    output_tokens = count_text_tokens(content, model=resolved["model"])
-                    usage = {
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "total_tokens": input_tokens + output_tokens,
-                    }
-                response_payload = {
-                    "id": _make_response_id("resp"),
-                    "object": "response",
-                    "created_at": int(time.time()),
-                    "model": resolved["id"],
-                    "status": "completed",
-                    "output": [
-                        {
-                            "id": _make_response_id("msg"),
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": content, "annotations": []}],
-                        }
-                    ],
-                    "usage": usage,
-                }
-                return jsonify(response_payload)
-            except openai.RateLimitError as e:
-                return error_response(str(e), 429, "rate_limit_error")
-            except openai.APIConnectionError as e:
-                return error_response(str(e), 502, "api_connection_error")
-            except openai.APIStatusError as e:
-                _log_upstream_error(e, g.request_id, g.upstream_url, payload=upstream_payload)
-                status = getattr(e, "status_code", 502) or 502
-                return error_response(str(e), status, "api_error")
-            except Exception as e:
-                return error_response(str(e), 500, "internal_error")
-
-            if hasattr(response_obj, "model_dump"):
-                response_payload = response_obj.model_dump()
-            elif hasattr(response_obj, "dict"):
-                response_payload = response_obj.dict()
-            elif isinstance(response_obj, dict):
-                response_payload = response_obj
-            else:
-                response_payload = {"output": response_obj}
-
-            if not response_payload.get("usage"):
-                input_messages = normalize_messages_from_input(responses_payload)
-                input_messages = coerce_messages_for_chat(input_messages)
-                input_tokens = count_messages_tokens(input_messages, model=resolved["model"])
-                output_text = _extract_response_output_text(response_payload.get("output"))
-                output_tokens = count_text_tokens(output_text, model=resolved["model"])
-                response_payload["usage"] = {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
-                }
-            response_payload = _ordered_payload(
-                response_payload,
-                ["id", "object", "created_at", "model", "status", "output", "usage"],
-            )
-            return jsonify(response_payload)
-
+            if not hasattr(client.responses, "with_raw_response"):
+                response_obj = client.responses.create(**payload)
+                return jsonify(_model_dump(response_obj))
+            response_obj = client.responses.with_raw_response.create(**payload)
+            if hasattr(response_obj, "parse"):
+                return jsonify(_model_dump(response_obj.parse()))
+            return jsonify(_model_dump(response_obj))
         except Exception as e:
             log_event(40, "responses_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
@@ -1521,99 +291,20 @@ def register_routes(app, settings):
             data = request.get_json(silent=True) or {}
             if "model" not in data and "modelId" in data:
                 data["model"] = data["modelId"]
-            try:
-                payload = EmbeddingsRequest.model_validate(data)
-            except ValidationError as e:
-                return error_response(str(e), 400, "invalid_request_error")
-            payload_dict = payload.model_dump(exclude_none=True)
-            if payload.input is None:
-                return error_response("No input provided", 400, "invalid_request_error")
-
-            resolved, error_message = _resolve_request_model(payload_dict)
+            resolved, error_message = _resolve_request_model(data)
             if error_message:
                 return error_response(error_message, 400)
-
-            params = {}
-            if "input" in payload_dict:
-                params["input"] = payload_dict["input"]
-            if "dimensions" in payload_dict:
-                params["dimensions"] = payload_dict["dimensions"]
-            if "encoding_format" in payload_dict:
-                params["encoding_format"] = payload_dict["encoding_format"]
-            if "user" in payload_dict:
-                params["user"] = payload_dict["user"]
-
+            payload = dict(data)
+            payload["model"] = resolved["model"]
             g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "embeddings")
-
-            log_cfg = get_logging_config()
-            upstream_payload = redact_payload(
-                {"model": resolved["model"], **params},
-                log_cfg.get("redact_keys", []),
-            )
-            if log_cfg.get("include_body"):
-                try:
-                    log_event(
-                        20,
-                        "upstream_request",
-                        request_id=g.request_id,
-                        provider=resolved.get("provider_name") or resolved.get("base_url"),
-                        upstream_url=g.upstream_url,
-                        payload=upstream_payload,
-                    )
-                except Exception as e:
-                    log_event(40, "upstream_log_failed", error=str(e))
-
             client = _build_client(settings, resolved["base_url"], resolved["api_key"])
-            try:
-                response_obj = client.embeddings.create(model=resolved["model"], **params)
-            except openai.RateLimitError as e:
-                return error_response(str(e), 429, "rate_limit_error")
-            except openai.APIConnectionError as e:
-                return error_response(str(e), 502, "api_connection_error")
-            except openai.APIStatusError as e:
-                _log_upstream_error(e, g.request_id, g.upstream_url, payload=upstream_payload)
-                status = getattr(e, "status_code", 502) or 502
-                return error_response(str(e), status, "api_error")
-            except Exception as e:
-                return error_response(str(e), 500, "internal_error")
-
-            response_payload = None
-            if hasattr(response_obj, "model_dump"):
-                response_payload = response_obj.model_dump()
-            elif hasattr(response_obj, "dict"):
-                response_payload = response_obj.dict()
-            elif isinstance(response_obj, dict):
-                response_payload = response_obj
-            if response_payload is None:
-                return jsonify(response_obj)
-            if response_payload.get("object") is None:
-                response_payload["object"] = "list"
-            if response_payload.get("model") is None:
-                response_payload["model"] = resolved["id"]
-            data_items = response_payload.get("data")
-            if isinstance(data_items, list):
-                for idx, item in enumerate(data_items):
-                    if not isinstance(item, dict):
-                        continue
-                    item.setdefault("object", "embedding")
-                    item.setdefault("index", idx)
-            if not response_payload.get("usage"):
-                raw_input = params.get("input")
-                texts = []
-                if isinstance(raw_input, list):
-                    texts = [str(v) for v in raw_input]
-                elif raw_input is not None:
-                    texts = [str(raw_input)]
-                prompt_tokens = sum(count_text_tokens(text, model=resolved["model"]) for text in texts)
-                response_payload["usage"] = {
-                    "prompt_tokens": prompt_tokens,
-                    "total_tokens": prompt_tokens,
-                }
-            response_payload = _ordered_payload(
-                response_payload,
-                ["object", "data", "model", "usage"],
-            )
-            return jsonify(response_payload)
+            if not hasattr(client.embeddings, "with_raw_response"):
+                response_obj = client.embeddings.create(**payload)
+                return jsonify(_model_dump(response_obj))
+            response_obj = client.embeddings.with_raw_response.create(**payload)
+            if hasattr(response_obj, "parse"):
+                return jsonify(_model_dump(response_obj.parse()))
+            return jsonify(_model_dump(response_obj))
 
         except Exception as e:
             log_event(40, "embeddings_error", error=str(e), request_id=g.request_id)
@@ -1629,18 +320,17 @@ def register_routes(app, settings):
             resolved, error_message = _resolve_request_model(data)
             if error_message:
                 return error_response(error_message, 400)
+            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "images/generations")
             payload = dict(data)
             payload["model"] = resolved["model"]
-            body = json.dumps(payload).encode("utf-8")
-            g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "images/generations")
-            return _forward_request(
-                settings,
-                g.upstream_url,
-                resolved.get("api_key", ""),
-                body_override=body,
-                headers_override={"Content-Type": "application/json"},
-                expect_json=True,
-            )
+            client = _build_client(settings, resolved["base_url"], resolved["api_key"])
+            if not hasattr(client.images, "with_raw_response"):
+                response_obj = client.images.generate(**payload)
+                return jsonify(_model_dump(response_obj))
+            response_obj = client.images.with_raw_response.generate(**payload)
+            if hasattr(response_obj, "parse"):
+                return jsonify(_model_dump(response_obj.parse()))
+            return jsonify(_model_dump(response_obj))
         except Exception as e:
             log_event(40, "images_generations_error", error=str(e), request_id=g.request_id)
             return error_response(str(e), 500, "internal_error")
@@ -1657,7 +347,7 @@ def register_routes(app, settings):
             if error_message:
                 return error_response(error_message, 400)
             g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "images/edits")
-            body, boundary = _build_multipart_body()
+            body, boundary = _build_multipart_body({"model": resolved["model"]})
             return _forward_request(
                 settings,
                 g.upstream_url,
@@ -1711,7 +401,7 @@ def register_routes(app, settings):
             resolved, error = _resolve_model_from_form_or_query()
             if error:
                 return error
-            body, boundary = _build_multipart_body()
+            body, boundary = _build_multipart_body({"model": resolved["model"]})
             g.upstream_url = _build_upstream_url_with_query(resolved.get("base_url", ""), endpoint)
             return _forward_request(
                 settings,
@@ -1773,507 +463,72 @@ def register_routes(app, settings):
     @app.route('/v1/assistants', methods=['GET', 'POST', 'PATCH'])
     @app.route('/v1/assistants/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     def assistants(subpath=None):
-        payload = request.get_json(silent=True) or {}
-        if "model" not in payload and "modelId" in payload:
-            payload["model"] = payload["modelId"]
-        if not subpath:
-            if request.method == "GET":
-                return _list_response(store.list_items("assistant"))
-            if request.method in ("POST", "PATCH"):
-                item = store.create_item("assistant", _normalize_assistant_data(payload), id_prefix="asst_")
-                return jsonify(item)
-        parts = subpath.split("/")
-        assistant_id = parts[0]
-        if len(parts) > 1 and parts[1] == "files":
-            if len(parts) == 2:
-                if request.method == "GET":
-                    return _list_response(store.list_items("assistant.file", parent_id=assistant_id))
-                if request.method == "POST":
-                    file_id = payload.get("file_id") or payload.get("file")
-                    item = store.create_item(
-                        "assistant.file",
-                        {"assistant_id": assistant_id, "file_id": file_id},
-                        parent_id=assistant_id,
-                        id_prefix="asst_file_",
-                    )
-                    return jsonify(item)
-            if len(parts) == 3 and request.method == "DELETE":
-                ok = store.delete_item("assistant.file", parts[2])
-                return jsonify({"id": parts[2], "object": "assistant.file.deleted", "deleted": ok})
-        if request.method == "GET":
-            item = store.get_item("assistant", assistant_id)
-            return jsonify(item) if item else _not_found("assistant", assistant_id)
-        if request.method in ("POST", "PATCH"):
-            existing = store.get_item("assistant", assistant_id)
-            item = store.update_item("assistant", assistant_id, _normalize_assistant_data(payload, existing))
-            return jsonify(item) if item else _not_found("assistant", assistant_id)
-        if request.method == "DELETE":
-            ok = store.delete_item("assistant", assistant_id)
-            return jsonify({"id": assistant_id, "object": "assistant.deleted", "deleted": ok})
-        return error_response("Method not allowed", 405, "invalid_request_error")
+        try:
+            endpoint = "assistants" + (f"/{subpath}" if subpath else "")
+            return _forward_openai_endpoint(endpoint, expect_json=True)
+        except Exception as e:
+            log_event(40, "assistants_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/threads', methods=['GET', 'POST', 'PATCH'])
     @app.route('/threads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     @app.route('/v1/threads', methods=['GET', 'POST', 'PATCH'])
     @app.route('/v1/threads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     def threads(subpath=None):
-        payload = request.get_json(silent=True) or {}
-        if not subpath:
-            if request.method == "GET":
-                return _list_response(store.list_items("thread"))
-            if request.method in ("POST", "PATCH"):
-                messages = payload.pop("messages", None)
-                thread = store.create_item("thread", _normalize_thread_data(payload), id_prefix="thread_")
-                if isinstance(messages, list):
-                    for msg in messages:
-                        store.create_item(
-                            "thread.message",
-                            _normalize_message_data(msg or {}, thread["id"]),
-                            parent_id=thread["id"],
-                            id_prefix="msg_",
-                        )
-                return jsonify(thread)
-        parts = subpath.split("/")
-        thread_id = parts[0]
-        if len(parts) == 1:
-            if request.method == "GET":
-                item = store.get_item("thread", thread_id)
-                return jsonify(item) if item else _not_found("thread", thread_id)
-            if request.method in ("POST", "PATCH"):
-                existing = store.get_item("thread", thread_id)
-                item = store.update_item("thread", thread_id, _normalize_thread_data(payload, existing))
-                return jsonify(item) if item else _not_found("thread", thread_id)
-            if request.method == "DELETE":
-                ok = store.delete_item("thread", thread_id)
-                return jsonify({"id": thread_id, "object": "thread.deleted", "deleted": ok})
-        if len(parts) >= 2 and parts[1] == "messages":
-            if len(parts) == 2:
-                if request.method == "GET":
-                    return _list_response(store.list_items("thread.message", parent_id=thread_id))
-                if request.method == "POST":
-                    run_id = payload.get("run_id")
-                    assistant_id = payload.get("assistant_id")
-                    run = None
-                    if run_id:
-                        run = store.get_item("thread.run", run_id)
-                        if not run:
-                            return _not_found("thread.run", run_id)
-                        assistant_id = assistant_id or run.get("assistant_id")
-                    msg = store.create_item(
-                        "thread.message",
-                        _normalize_message_data(payload, thread_id, run_id, assistant_id),
-                        parent_id=thread_id,
-                        id_prefix="msg_",
-                    )
-                    if run_id and msg.get("role") == "assistant":
-                        usage = _compute_run_usage(thread_id, run or {"id": run_id, "model": None, "created_at": 0})
-                        completion_tokens = count_messages_tokens([msg], model=(run or {}).get("model"))
-                        step_status = "completed" if completion_tokens > 0 else "in_progress"
-                        store.create_item(
-                            "thread.run.step",
-                            _normalize_run_step_data(
-                                thread_id,
-                                run_id,
-                                msg["id"],
-                                assistant_id=assistant_id,
-                                status=step_status,
-                                usage={
-                                    "prompt_tokens": usage["prompt_tokens"],
-                                    "completion_tokens": completion_tokens,
-                                    "total_tokens": usage["prompt_tokens"] + completion_tokens,
-                                },
-                            ),
-                            parent_id=run_id,
-                            id_prefix="step_",
-                        )
-                        if run:
-                            _refresh_run_record(thread_id, run)
-                    return jsonify(msg)
-            if len(parts) == 3 and request.method == "GET":
-                item = store.get_item("thread.message", parts[2])
-                return jsonify(item) if item else _not_found("thread.message", parts[2])
-        if len(parts) >= 2 and parts[1] == "runs":
-            if len(parts) == 2:
-                if request.method == "GET":
-                    runs = [
-                        _refresh_run_record(thread_id, run)
-                        for run in store.list_items("thread.run", parent_id=thread_id)
-                    ]
-                    return _list_response(runs)
-                if request.method == "POST":
-                    run = store.create_item(
-                        "thread.run",
-                        _normalize_run_data(payload, thread_id),
-                        parent_id=thread_id,
-                        id_prefix="run_",
-                    )
-                    run = _refresh_run_record(thread_id, run)
-                    return jsonify(run)
-            if len(parts) >= 3:
-                run_id = parts[2]
-                if len(parts) == 3 and request.method == "GET":
-                    item = store.get_item("thread.run", run_id)
-                    if not item:
-                        return _not_found("thread.run", run_id)
-                    item = _refresh_run_record(thread_id, item)
-                    return jsonify(item)
-                if len(parts) == 4 and parts[3] == "cancel" and request.method in ("POST", "PATCH"):
-                    existing = store.get_item("thread.run", run_id)
-                    if not existing:
-                        return _not_found("thread.run", run_id)
-                    updates = {"status": "cancelled", "cancelled_at": int(time.time())}
-                    item = store.update_item(
-                        "thread.run",
-                        run_id,
-                        _normalize_run_data(updates, thread_id, existing.get("assistant_id"), existing),
-                    )
-                    return jsonify(item)
-                if len(parts) >= 4 and parts[3] == "steps":
-                    if len(parts) == 4 and request.method == "GET":
-                        steps = [
-                            _refresh_run_step_record(thread_id, step)
-                            for step in store.list_items("thread.run.step", parent_id=run_id)
-                        ]
-                        return _list_response(steps)
-                    if len(parts) == 5 and request.method == "GET":
-                        item = store.get_item("thread.run.step", parts[4])
-                        if not item:
-                            return _not_found("thread.run.step", parts[4])
-                        item = _refresh_run_step_record(thread_id, item)
-                        return jsonify(item)
-        return error_response("Not found", 404, "invalid_request_error")
+        try:
+            endpoint = "threads" + (f"/{subpath}" if subpath else "")
+            return _forward_openai_endpoint(endpoint, expect_json=True)
+        except Exception as e:
+            log_event(40, "threads_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/vector_stores', methods=['GET', 'POST', 'PATCH'])
     @app.route('/vector_stores/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     @app.route('/v1/vector_stores', methods=['GET', 'POST', 'PATCH'])
     @app.route('/v1/vector_stores/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     def vector_stores(subpath=None):
-        payload = request.get_json(silent=True) or {}
-        if not subpath:
-            if request.method == "GET":
-                return _list_response(store.list_items("vector_store"))
-            if request.method in ("POST", "PATCH"):
-                item = store.create_item("vector_store", _normalize_vector_store_data(payload), id_prefix="vs_")
-                return jsonify(item)
-        parts = subpath.split("/")
-        store_id = parts[0]
-        if len(parts) == 1:
-            if request.method == "GET":
-                item = store.get_item("vector_store", store_id)
-                return jsonify(item) if item else _not_found("vector_store", store_id)
-            if request.method in ("POST", "PATCH"):
-                existing = store.get_item("vector_store", store_id)
-                item = store.update_item("vector_store", store_id, _normalize_vector_store_data(payload, existing))
-                return jsonify(item) if item else _not_found("vector_store", store_id)
-            if request.method == "DELETE":
-                ok = store.delete_item("vector_store", store_id)
-                return jsonify({"id": store_id, "object": "vector_store.deleted", "deleted": ok})
-        if len(parts) >= 2 and parts[1] == "files":
-            if len(parts) == 2:
-                if request.method == "GET":
-                    return _list_response(store.list_items("vector_store.file", parent_id=store_id))
-                if request.method == "POST":
-                    file_id = payload.get("file_id") or payload.get("file")
-                    item = store.create_item(
-                        "vector_store.file",
-                        _normalize_vector_store_file_data(store_id, file_id),
-                        parent_id=store_id,
-                        id_prefix="vsf_",
-                    )
-                    existing_store = store.get_item("vector_store", store_id)
-                    if existing_store:
-                        counts = existing_store.get("file_counts") or {}
-                        updated_counts = {
-                            "in_progress": counts.get("in_progress", 0),
-                            "completed": counts.get("completed", 0) + 1,
-                            "failed": counts.get("failed", 0),
-                            "cancelled": counts.get("cancelled", 0),
-                            "total": counts.get("total", 0) + 1,
-                        }
-                        store.update_item(
-                            "vector_store",
-                            store_id,
-                            _normalize_vector_store_data({"file_counts": updated_counts}, existing_store),
-                        )
-                    return jsonify(item)
-            if len(parts) == 3 and request.method == "DELETE":
-                ok = store.delete_item("vector_store.file", parts[2])
-                return jsonify({"id": parts[2], "object": "vector_store.file.deleted", "deleted": ok})
-        if len(parts) >= 2 and parts[1] == "file_batches":
-            if len(parts) == 2:
-                if request.method == "GET":
-                    return _list_response(store.list_items("vector_store.file_batch", parent_id=store_id))
-                if request.method == "POST":
-                    file_ids = payload.get("file_ids") or []
-                    batch = store.create_item(
-                        "vector_store.file_batch",
-                        {
-                            "vector_store_id": store_id,
-                            "status": "completed",
-                            "file_counts": {
-                                "in_progress": 0,
-                                "completed": len(file_ids),
-                                "failed": 0,
-                                "cancelled": 0,
-                                "total": len(file_ids),
-                            },
-                            "completed_at": int(time.time()),
-                        },
-                        parent_id=store_id,
-                        id_prefix="vsfb_",
-                    )
-                    for file_id in file_ids:
-                        store.create_item(
-                            "vector_store.file",
-                            _normalize_vector_store_file_data(store_id, file_id),
-                            parent_id=store_id,
-                            id_prefix="vsf_",
-                        )
-                    existing_store = store.get_item("vector_store", store_id)
-                    if existing_store:
-                        counts = existing_store.get("file_counts") or {}
-                        updated_counts = {
-                            "in_progress": counts.get("in_progress", 0),
-                            "completed": counts.get("completed", 0) + len(file_ids),
-                            "failed": counts.get("failed", 0),
-                            "cancelled": counts.get("cancelled", 0),
-                            "total": counts.get("total", 0) + len(file_ids),
-                        }
-                        store.update_item(
-                            "vector_store",
-                            store_id,
-                            _normalize_vector_store_data({"file_counts": updated_counts}, existing_store),
-                        )
-                    return jsonify(batch)
-            if len(parts) >= 3:
-                batch_id = parts[2]
-                if len(parts) == 3 and request.method == "GET":
-                    item = store.get_item("vector_store.file_batch", batch_id)
-                    return jsonify(item) if item else _not_found("vector_store.file_batch", batch_id)
-                if len(parts) == 4 and parts[3] == "files" and request.method == "GET":
-                    return _list_response(store.list_items("vector_store.file", parent_id=store_id))
-        return error_response("Not found", 404, "invalid_request_error")
+        try:
+            endpoint = "vector_stores" + (f"/{subpath}" if subpath else "")
+            return _forward_openai_endpoint(endpoint, expect_json=True)
+        except Exception as e:
+            log_event(40, "vector_stores_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/files', methods=['GET', 'POST', 'PATCH'])
     @app.route('/files/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     @app.route('/v1/files', methods=['GET', 'POST', 'PATCH'])
     @app.route('/v1/files/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     def files(subpath=None):
-        if not subpath:
-            if request.method == "GET":
-                return _list_response(store.list_items("file"))
-            if request.method in ("POST", "PATCH"):
-                if request.mimetype == "multipart/form-data":
-                    storage = request.files.get("file")
-                    if not storage:
-                        return error_response("No file provided", 400, "invalid_request_error")
-                    content = storage.read()
-                    info = store.create_file(
-                        storage.filename or "file",
-                        storage.mimetype or "application/octet-stream",
-                        content,
-                    )
-                    purpose = request.form.get("purpose")
-                    item = store.create_item(
-                        "file",
-                        _normalize_file_data(
-                            {
-                                "bytes": info["bytes"],
-                                "filename": info["filename"],
-                                "purpose": purpose,
-                                "status": info.get("status", "processed"),
-                                "expires_at": None,
-                            }
-                        ),
-                        item_id=info["id"],
-                        id_prefix="file-",
-                    )
-                    purpose = request.form.get("purpose")
-                    if purpose:
-                        item = store.update_item("file", info["id"], {"purpose": purpose})
-                    return jsonify(item)
-                payload = request.get_json(silent=True) or {}
-                item = store.create_item("file", _normalize_file_data(payload), id_prefix="file-")
-                return jsonify(item)
-        parts = subpath.split("/")
-        file_id = parts[0]
-        if len(parts) == 1:
-            if request.method == "GET":
-                item = store.get_item("file", file_id)
-                return jsonify(item) if item else _not_found("file", file_id)
-            if request.method == "DELETE":
-                ok = store.delete_item("file", file_id)
-                store.delete_file(file_id)
-                return jsonify({"id": file_id, "object": "file.deleted", "deleted": ok})
-        if len(parts) == 2 and parts[1] == "content" and request.method == "GET":
-            file_info = store.get_file(file_id)
-            if not file_info:
-                return _not_found("file", file_id)
-            with open(file_info["path"], "rb") as f:
-                data = f.read()
-            response = Response(data, status=200)
-            response.headers["Content-Type"] = file_info.get("content_type") or "application/octet-stream"
-            return response
-        return error_response("Not found", 404, "invalid_request_error")
+        try:
+            endpoint = "files" + (f"/{subpath}" if subpath else "")
+            return _forward_openai_endpoint(endpoint, expect_json=True)
+        except Exception as e:
+            log_event(40, "files_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/uploads', methods=['GET', 'POST', 'PATCH'])
     @app.route('/uploads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     @app.route('/v1/uploads', methods=['GET', 'POST', 'PATCH'])
     @app.route('/v1/uploads/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     def uploads(subpath=None):
-        payload = request.get_json(silent=True) or {}
-        if not subpath:
-            if request.method == "GET":
-                return _list_response(store.list_items("upload"))
-            if request.method in ("POST", "PATCH"):
-                item = store.create_item("upload", _normalize_upload_data(payload), id_prefix="upload_")
-                return jsonify(item)
-        parts = subpath.split("/")
-        upload_id = parts[0]
-        if len(parts) == 1:
-            if request.method == "GET":
-                item = store.get_item("upload", upload_id)
-                return jsonify(item) if item else _not_found("upload", upload_id)
-            if request.method == "DELETE":
-                ok = store.delete_item("upload", upload_id)
-                store.delete_upload_parts(upload_id)
-                for legacy_type in ("upload.part", "upload_part"):
-                    for legacy in store.list_items(legacy_type, parent_id=upload_id):
-                        store.delete_item(legacy_type, legacy["id"])
-                return jsonify({"id": upload_id, "object": "upload.deleted", "deleted": ok})
-        if len(parts) >= 2 and parts[1] == "parts":
-            existing_upload = store.get_item("upload", upload_id)
-            if not existing_upload:
-                return _not_found("upload", upload_id)
-            if request.method == "GET":
-                legacy_parts = store.list_items("upload_part", parent_id=upload_id)
-                new_parts = store.list_items("upload.part", parent_id=upload_id)
-                file_parts = store.list_upload_parts(upload_id)
-                parts_items = [
-                    _normalize_upload_part_object(_strip_upload_part_payload(item))
-                    for item in (file_parts + legacy_parts + new_parts)
-                ]
-                parts_items = sorted(parts_items, key=lambda item: item.get("created_at", 0))
-                return jsonify(
-                    {
-                        "object": "list",
-                        "data": parts_items,
-                        "first_id": parts_items[0]["id"] if parts_items else None,
-                        "last_id": parts_items[-1]["id"] if parts_items else None,
-                        "has_more": False,
-                    }
-                )
-            if request.method == "POST":
-                data = request.get_data() or b""
-                part = store.create_upload_part(upload_id, data)
-                updated_bytes = (existing_upload.get("bytes") or 0) + len(data)
-                updates = _normalize_upload_data({"bytes": updated_bytes, "status": "in_progress"}, existing_upload)
-                store.update_item("upload", upload_id, updates)
-                return jsonify(_normalize_upload_part_object(_strip_upload_part_payload(part)))
-        if len(parts) == 2 and parts[1] == "complete" and request.method in ("POST", "PATCH"):
-            existing = store.get_item("upload", upload_id)
-            if not existing:
-                return _not_found("upload", upload_id)
-            file_parts = store.list_upload_parts(upload_id)
-            if file_parts:
-                parts_list = file_parts
-            else:
-                new_parts = store.list_items("upload.part", parent_id=upload_id)
-                parts_list = new_parts if new_parts else store.list_items("upload_part", parent_id=upload_id)
-            parts_list = sorted(parts_list, key=lambda item: item.get("created_at", 0))
-            filename = existing.get("filename") or "upload"
-            mime_type = existing.get("mime_type") or "application/octet-stream"
-
-            def iter_parts():
-                for part in parts_list:
-                    path = part.get("path")
-                    if path and os.path.exists(path):
-                        with open(path, "rb") as f:
-                            while True:
-                                chunk = f.read(1024 * 1024)
-                                if not chunk:
-                                    break
-                                yield chunk
-                    else:
-                        data_b64 = part.get("data_b64")
-                        if data_b64:
-                            try:
-                                yield base64.b64decode(data_b64)
-                            except Exception:
-                                continue
-
-            file_info = store.create_file_from_iterator(filename, mime_type, iter_parts())
-            file_item = store.create_item(
-                "file",
-                _normalize_file_data(
-                    {
-                        "bytes": file_info["bytes"],
-                        "filename": file_info["filename"],
-                        "purpose": existing.get("purpose"),
-                        "status": file_info.get("status", "processed"),
-                        "expires_at": None,
-                    }
-                ),
-                item_id=file_info["id"],
-                id_prefix="file-",
-            )
-            store.update_item(
-                "upload",
-                upload_id,
-                _normalize_upload_data({"status": "completed", "file_id": file_item["id"]}, existing),
-            )
-            store.delete_upload_parts(upload_id)
-            for legacy_type in ("upload.part", "upload_part"):
-                for legacy in store.list_items(legacy_type, parent_id=upload_id):
-                    store.delete_item(legacy_type, legacy["id"])
-            return jsonify(file_item)
-        if len(parts) == 2 and parts[1] == "cancel" and request.method in ("POST", "PATCH"):
-            existing = store.get_item("upload", upload_id)
-            if not existing:
-                return _not_found("upload", upload_id)
-            item = store.update_item(
-                "upload",
-                upload_id,
-                _normalize_upload_data({"status": "cancelled"}, existing),
-            )
-            store.delete_upload_parts(upload_id)
-            for legacy_type in ("upload.part", "upload_part"):
-                for legacy in store.list_items(legacy_type, parent_id=upload_id):
-                    store.delete_item(legacy_type, legacy["id"])
-            return jsonify(item)
-        return error_response("Not found", 404, "invalid_request_error")
+        try:
+            endpoint = "uploads" + (f"/{subpath}" if subpath else "")
+            return _forward_openai_endpoint(endpoint, expect_json=True)
+        except Exception as e:
+            log_event(40, "uploads_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/batches', methods=['GET', 'POST', 'PATCH'])
     @app.route('/batches/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     @app.route('/v1/batches', methods=['GET', 'POST', 'PATCH'])
     @app.route('/v1/batches/<path:subpath>', methods=['GET', 'POST', 'DELETE', 'PATCH'])
     def batches(subpath=None):
-        payload = request.get_json(silent=True) or {}
-        if not subpath:
-            if request.method == "GET":
-                return _list_response(store.list_items("batch"))
-            if request.method in ("POST", "PATCH"):
-                item = store.create_item("batch", _normalize_batch_data(payload), id_prefix="batch_")
-                return jsonify(item)
-        parts = subpath.split("/") if subpath else []
-        batch_id = parts[0] if parts else ""
-        if len(parts) == 2 and parts[1] == "cancel" and request.method in ("POST", "PATCH"):
-            existing = store.get_item("batch", batch_id)
-            if not existing:
-                return _not_found("batch", batch_id)
-            item = store.update_item("batch", batch_id, _normalize_batch_data({"status": "cancelled"}, existing))
-            return jsonify(item)
-        if request.method == "GET":
-            item = store.get_item("batch", batch_id)
-            return jsonify(item) if item else _not_found("batch", batch_id)
-        if request.method in ("POST", "PATCH"):
-            existing = store.get_item("batch", batch_id)
-            item = store.update_item("batch", batch_id, _normalize_batch_data(payload, existing))
-            return jsonify(item) if item else _not_found("batch", batch_id)
-        if request.method == "DELETE":
-            ok = store.delete_item("batch", batch_id)
-            return jsonify({"id": batch_id, "object": "batch.deleted", "deleted": ok})
-        return error_response("Not found", 404, "invalid_request_error")
+        try:
+            endpoint = "batches" + (f"/{subpath}" if subpath else "")
+            return _forward_openai_endpoint(endpoint, expect_json=True)
+        except Exception as e:
+            log_event(40, "batches_error", error=str(e), request_id=g.request_id)
+            return error_response(str(e), 500, "internal_error")
 
     @app.route('/models', methods=['GET'])
     @app.route('/v1/models', methods=['GET'])
