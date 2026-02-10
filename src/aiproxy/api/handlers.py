@@ -18,6 +18,7 @@ from ..utils.params import (
     coerce_messages_for_chat,
     extract_chat_params_from_responses,
     normalize_messages_from_input,
+    request_has_input_file,
 )
 from ..utils.chat_adapter import ensure_chat_completion_model
 from ..utils.responses_adapter import build_response_payload_from_chat
@@ -299,6 +300,7 @@ def register_routes(app, settings):
             payload = dict(data)
             payload["model"] = resolved["model"]
             mode = _pick_responses_mode(resolved)
+            has_input_file = request_has_input_file(payload)
             fallback_messages = normalize_messages_from_input(payload)
             fallback_messages = _apply_instructions(
                 fallback_messages, payload.get("instructions") or payload.get("system")
@@ -308,6 +310,12 @@ def register_routes(app, settings):
             if "max_tokens" not in fallback_params and "max_output_tokens" in payload:
                 fallback_params["max_tokens"] = payload.get("max_output_tokens")
             if mode == "chat":
+                if has_input_file:
+                    return error_response(
+                        "input_file requires a responses-capable provider",
+                        400,
+                        "invalid_request_error",
+                    )
                 if not fallback_messages:
                     return error_response("No input provided", 400, "invalid_request_error")
                 g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
@@ -321,11 +329,12 @@ def register_routes(app, settings):
                                 client,
                                 resolved["model"],
                                 fallback_messages,
-                                resolved["id"],
+                                resolved["model"],
                                 response_id,
                                 created,
                                 request_id=g.request_id,
                                 upstream_url=g.upstream_url,
+                                request_payload=payload,
                                 **fallback_params,
                             )
                         ),
@@ -340,15 +349,22 @@ def register_routes(app, settings):
                     response_obj,
                     response_id=response_id,
                     created=created,
-                    model_id=resolved["id"],
+                    model_id=resolved["model"],
                     model_name=resolved["model"],
                     messages=fallback_messages,
+                    request_payload=payload,
                 )
                 return jsonify(response_payload)
             g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "responses")
             client = _build_client(settings, resolved["base_url"], resolved["api_key"])
             if payload.get("stream"):
                 if not hasattr(client.responses, "with_streaming_response") or not hasattr(client.responses, "with_raw_response"):
+                    if has_input_file:
+                        return error_response(
+                            "input_file requires a responses-capable provider",
+                            400,
+                            "invalid_request_error",
+                        )
                     if not fallback_messages:
                         return error_response("No input provided", 400, "invalid_request_error")
                     response_id = _make_response_id("resp")
@@ -359,11 +375,12 @@ def register_routes(app, settings):
                                 client,
                                 resolved["model"],
                                 fallback_messages,
-                                resolved["id"],
+                                resolved["model"],
                                 response_id,
                                 created,
                                 request_id=g.request_id,
                                 upstream_url=g.upstream_url,
+                                request_payload=payload,
                                 **fallback_params,
                             )
                         ),
@@ -377,6 +394,12 @@ def register_routes(app, settings):
                     mimetype='text/event-stream',
                 )
             if not hasattr(client.responses, "with_raw_response"):
+                if has_input_file:
+                    return error_response(
+                        "input_file requires a responses-capable provider",
+                        400,
+                        "invalid_request_error",
+                    )
                 if not fallback_messages:
                     return error_response("No input provided", 400, "invalid_request_error")
                 response_obj = client.chat.completions.create(
@@ -388,9 +411,10 @@ def register_routes(app, settings):
                     response_obj,
                     response_id=response_id,
                     created=created,
-                    model_id=resolved["id"],
+                    model_id=resolved["model"],
                     model_name=resolved["model"],
                     messages=fallback_messages,
+                    request_payload=payload,
                 )
                 return jsonify(response_payload)
             response_obj = client.responses.with_raw_response.create(**payload)

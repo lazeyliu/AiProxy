@@ -13,6 +13,28 @@ def _bytes_from_array(value):
     return None
 
 
+def _payload_has_input_file(payload) -> bool:
+    if isinstance(payload, dict):
+        if payload.get("type") == "input_file":
+            return True
+        for value in payload.values():
+            if _payload_has_input_file(value):
+                return True
+        return False
+    if isinstance(payload, list):
+        return any(_payload_has_input_file(item) for item in payload)
+    return False
+
+
+def request_has_input_file(payload_dict) -> bool:
+    """Detect whether a responses request contains an input_file part."""
+    if not isinstance(payload_dict, dict):
+        return False
+    return _payload_has_input_file(payload_dict.get("input")) or _payload_has_input_file(
+        payload_dict.get("messages")
+    )
+
+
 def _extract_image_url(part):
     if not isinstance(part, dict):
         return None
@@ -145,6 +167,17 @@ def extract_chat_params_from_responses(payload_dict):
         params["modalities"] = payload_dict["modalities"]
     if "n" in payload_dict:
         params["n"] = payload_dict["n"]
+    if "logprobs" in payload_dict:
+        params["logprobs"] = payload_dict["logprobs"]
+    if "top_logprobs" in payload_dict:
+        params["top_logprobs"] = payload_dict["top_logprobs"]
+    include = payload_dict.get("include")
+    if isinstance(include, str):
+        include = [include]
+    if isinstance(include, list):
+        for item in include:
+            if item == "message.output_text.logprobs":
+                params["logprobs"] = True
     if "max_output_tokens" in payload_dict:
         params["max_tokens"] = payload_dict["max_output_tokens"]
     return params

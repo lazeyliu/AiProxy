@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from .token_count import count_messages_tokens, count_text_tokens
@@ -62,6 +63,8 @@ def _normalize_usage(usage_obj: Any) -> dict:
             "input_tokens": None,
             "output_tokens": None,
             "total_tokens": None,
+            "input_tokens_details": {"cached_tokens": None},
+            "output_tokens_details": {"reasoning_tokens": None},
         }
     input_tokens = usage_payload.get("input_tokens")
     output_tokens = usage_payload.get("output_tokens")
@@ -72,10 +75,18 @@ def _normalize_usage(usage_obj: Any) -> dict:
         output_tokens = usage_payload.get("completion_tokens")
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
         total_tokens = input_tokens + output_tokens
+    input_details = dict(usage_payload.get("input_tokens_details") or {})
+    if input_details.get("cached_tokens") is None:
+        input_details["cached_tokens"] = 0 if input_tokens is not None else None
+    output_details = dict(usage_payload.get("output_tokens_details") or {})
+    if output_details.get("reasoning_tokens") is None:
+        output_details["reasoning_tokens"] = 0 if output_tokens is not None else None
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
+        "input_tokens_details": input_details,
+        "output_tokens_details": output_details,
     }
 
 
@@ -102,6 +113,180 @@ def _normalize_message_content(content: Any) -> str:
     if content is None:
         return ""
     return str(content)
+
+
+def _normalize_reasoning(reasoning: Any) -> dict:
+    if isinstance(reasoning, dict):
+        return {
+            "effort": reasoning.get("effort"),
+            "summary": reasoning.get("summary"),
+        }
+    return {"effort": None, "summary": None}
+
+
+def _normalize_text_format(text_payload: Any) -> dict:
+    if isinstance(text_payload, dict):
+        if "format" in text_payload and isinstance(text_payload["format"], dict):
+            return {"format": text_payload["format"]}
+        if "type" in text_payload:
+            return {"format": text_payload}
+    return {"format": {"type": "text"}}
+
+
+def _normalize_metadata(metadata: Any) -> dict:
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _payload_has_input_file(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        if payload.get("type") == "input_file":
+            return True
+        for value in payload.values():
+            if _payload_has_input_file(value):
+                return True
+        return False
+    if isinstance(payload, list):
+        return any(_payload_has_input_file(item) for item in payload)
+    return False
+
+
+def _request_has_input_file(request_payload: dict | None) -> bool:
+    if not isinstance(request_payload, dict):
+        return False
+    return _payload_has_input_file(request_payload.get("input")) or _payload_has_input_file(
+        request_payload.get("messages")
+    )
+
+
+def _should_include_logprobs(request_payload: dict | None) -> bool:
+    if not isinstance(request_payload, dict):
+        return False
+    include = request_payload.get("include")
+    if isinstance(include, str):
+        include = [include]
+    if isinstance(include, list):
+        for item in include:
+            if item == "message.output_text.logprobs":
+                return True
+    if request_payload.get("logprobs"):
+        return True
+    if request_payload.get("top_logprobs") is not None:
+        return True
+    if _request_has_input_file(request_payload):
+        return True
+    return False
+
+
+def build_response_envelope(
+    *,
+    response_id: str,
+    created: int,
+    model_id: str,
+    status: str,
+    output_items: list,
+    usage_payload: dict | None,
+    request_payload: dict | None = None,
+    completed_at: int | None = None,
+    error: dict | None = None,
+    incomplete_details: dict | None = None,
+) -> dict:
+    wants_logprobs = _should_include_logprobs(request_payload)
+    has_input_file = _request_has_input_file(request_payload)
+    response_payload = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "completed_at": completed_at,
+        "background": False if has_input_file else None,
+        "error": error,
+        "incomplete_details": incomplete_details,
+        "instructions": None,
+        "max_output_tokens": None,
+        "max_tool_calls": None,
+        "model": model_id,
+        "output": output_items,
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "reasoning": {"effort": None, "summary": None},
+        "service_tier": "default" if has_input_file else None,
+        "store": True,
+        "temperature": 1,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_logprobs": 0 if wants_logprobs else None,
+        "top_p": 1,
+        "truncation": "disabled",
+        "usage": usage_payload,
+        "user": None,
+        "metadata": {},
+    }
+    if request_payload:
+        if "instructions" in request_payload:
+            response_payload["instructions"] = request_payload.get("instructions")
+        elif isinstance(request_payload.get("system"), str):
+            response_payload["instructions"] = request_payload.get("system")
+        if "max_output_tokens" in request_payload:
+            response_payload["max_output_tokens"] = request_payload.get("max_output_tokens")
+        elif "max_tokens" in request_payload:
+            response_payload["max_output_tokens"] = request_payload.get("max_tokens")
+        if "parallel_tool_calls" in request_payload:
+            response_payload["parallel_tool_calls"] = request_payload.get("parallel_tool_calls")
+        if "previous_response_id" in request_payload:
+            response_payload["previous_response_id"] = request_payload.get("previous_response_id")
+        if "reasoning" in request_payload:
+            response_payload["reasoning"] = _normalize_reasoning(request_payload.get("reasoning"))
+        if "store" in request_payload:
+            response_payload["store"] = request_payload.get("store")
+        if "temperature" in request_payload:
+            response_payload["temperature"] = request_payload.get("temperature")
+        if "text" in request_payload:
+            response_payload["text"] = _normalize_text_format(request_payload.get("text"))
+        if "tool_choice" in request_payload:
+            response_payload["tool_choice"] = request_payload.get("tool_choice")
+        if "tools" in request_payload:
+            response_payload["tools"] = request_payload.get("tools") or []
+        if "top_p" in request_payload:
+            response_payload["top_p"] = request_payload.get("top_p")
+        if "truncation" in request_payload:
+            response_payload["truncation"] = request_payload.get("truncation")
+        if "user" in request_payload:
+            response_payload["user"] = request_payload.get("user")
+        if "metadata" in request_payload:
+            response_payload["metadata"] = _normalize_metadata(request_payload.get("metadata"))
+        if "background" in request_payload:
+            response_payload["background"] = request_payload.get("background")
+        if "max_tool_calls" in request_payload:
+            response_payload["max_tool_calls"] = request_payload.get("max_tool_calls")
+        if "service_tier" in request_payload:
+            response_payload["service_tier"] = request_payload.get("service_tier")
+        if "top_logprobs" in request_payload:
+            response_payload["top_logprobs"] = request_payload.get("top_logprobs")
+        for key in (
+            "conversation",
+            "prompt",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "safety_identifier",
+        ):
+            if key in request_payload:
+                response_payload[key] = request_payload.get(key)
+    keep_null_background = isinstance(request_payload, dict) and "background" in request_payload
+    keep_null_max_tool_calls = has_input_file or (
+        isinstance(request_payload, dict) and "max_tool_calls" in request_payload
+    )
+    keep_null_service_tier = isinstance(request_payload, dict) and "service_tier" in request_payload
+    keep_null_top_logprobs = isinstance(request_payload, dict) and "top_logprobs" in request_payload
+    if response_payload.get("background") is None and not keep_null_background:
+        response_payload.pop("background", None)
+    if response_payload.get("max_tool_calls") is None and not keep_null_max_tool_calls:
+        response_payload.pop("max_tool_calls", None)
+    if response_payload.get("service_tier") is None and not keep_null_service_tier:
+        response_payload.pop("service_tier", None)
+    if response_payload.get("top_logprobs") is None and not keep_null_top_logprobs:
+        response_payload.pop("top_logprobs", None)
+    return response_payload
 
 
 def _extract_tool_calls(message: Any) -> list[dict]:
@@ -202,6 +387,14 @@ def _compute_usage_from_outputs(messages: list, model_name: str, output_texts: l
     }
 
 
+def _finish_reason_to_incomplete(reason: Any) -> dict | None:
+    if reason == "length":
+        return {"reason": "max_tokens"}
+    if reason == "content_filter":
+        return {"reason": "content_filter"}
+    return None
+
+
 def build_response_payload_from_chat(
     response_obj: Any,
     *,
@@ -210,6 +403,7 @@ def build_response_payload_from_chat(
     model_id: str,
     model_name: str,
     messages: list,
+    request_payload: dict | None = None,
 ) -> dict:
     output_items, output_texts, tool_args = _build_output_items_from_chat(response_obj, response_id)
     computed_usage = _compute_usage_from_outputs(messages, model_name, output_texts, tool_args)
@@ -220,12 +414,26 @@ def build_response_payload_from_chat(
         usage_payload["output_tokens"] = computed_usage["output_tokens"]
     if usage_payload.get("total_tokens") is None:
         usage_payload["total_tokens"] = computed_usage["total_tokens"]
+    choices = getattr(response_obj, "choices", None) or []
+    finish_reason = None
+    if choices:
+        first_choice = choices[0]
+        finish_reason = getattr(first_choice, "finish_reason", None)
+        if finish_reason is None and isinstance(first_choice, dict):
+            finish_reason = first_choice.get("finish_reason")
+    incomplete_details = _finish_reason_to_incomplete(finish_reason)
+    status = "incomplete" if incomplete_details else "completed"
+    completed_at = None if status != "completed" else int(time.time())
     return build_response_completed_payload(
         response_id=response_id,
         created=created,
         model_id=model_id,
         output_items=output_items,
         usage_payload=usage_payload,
+        request_payload=request_payload,
+        status=status,
+        completed_at=completed_at,
+        incomplete_details=incomplete_details,
     )
 
 
@@ -236,54 +444,25 @@ def build_response_payload(
     model_id: str,
     content: str,
     usage_payload: dict,
+    request_payload: dict | None = None,
 ) -> dict:
-    try:
-        from openai.types.responses import (
-            Response,
-            ResponseOutputMessage,
-            ResponseOutputText,
-            ResponseUsage,
-        )
-        response_usage = ResponseUsage(
-            input_tokens=usage_payload.get("input_tokens"),
-            output_tokens=usage_payload.get("output_tokens"),
-            total_tokens=usage_payload.get("total_tokens"),
-        )
-        message = ResponseOutputMessage(
-            id=f"msg_{response_id}",
-            type="message",
+    output_items = [
+        build_output_message_item(
+            item_id=f"msg_{response_id}",
+            text=content,
             status="completed",
-            role="assistant",
-            content=[ResponseOutputText(type="output_text", text=content, annotations=[])],
         )
-        response_payload = Response(
-            id=response_id,
-            object="response",
-            created_at=created,
-            model=model_id,
-            status="completed",
-            output=[message],
-            usage=response_usage,
-        )
-        return _model_dump(response_payload)
-    except Exception:
-        return {
-            "id": response_id,
-            "object": "response",
-            "created_at": created,
-            "model": model_id,
-            "status": "completed",
-            "output": [
-                {
-                    "id": f"msg_{response_id}",
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": content, "annotations": []}],
-                }
-            ],
-            "usage": usage_payload,
-        }
+    ]
+    return build_response_completed_payload(
+        response_id=response_id,
+        created=created,
+        model_id=model_id,
+        output_items=output_items,
+        usage_payload=usage_payload,
+        request_payload=request_payload,
+        status="completed",
+        completed_at=int(time.time()),
+    )
 
 
 def build_response_completed_payload(
@@ -293,31 +472,36 @@ def build_response_completed_payload(
     model_id: str,
     output_items: list,
     usage_payload: dict,
+    request_payload: dict | None = None,
+    status: str = "completed",
+    completed_at: int | None = None,
+    incomplete_details: dict | None = None,
+    error: dict | None = None,
 ) -> dict:
-    try:
-        from openai.types.responses import Response, ResponseUsage
-        response_payload = Response(
-            id=response_id,
-            object="response",
-            created_at=created,
-            model=model_id,
-            status="completed",
-            output=output_items,
-            usage=ResponseUsage(
-                input_tokens=usage_payload.get("input_tokens"),
-                output_tokens=usage_payload.get("output_tokens"),
-                total_tokens=usage_payload.get("total_tokens"),
-            ),
-        )
-        return _model_dump(response_payload)
-    except Exception:
-        dumped_items = [dump_output_item(item) for item in output_items]
-        return {
-            "id": response_id,
-            "object": "response",
-            "created_at": created,
-            "model": model_id,
-            "status": "completed",
-            "output": dumped_items,
-            "usage": usage_payload,
-        }
+    dumped_items = [dump_output_item(item) for item in output_items]
+    if _should_include_logprobs(request_payload):
+        for item in dumped_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "output_text" and "logprobs" not in part:
+                    part["logprobs"] = []
+    return build_response_envelope(
+        response_id=response_id,
+        created=created,
+        model_id=model_id,
+        status=status,
+        output_items=dumped_items,
+        usage_payload=usage_payload,
+        request_payload=request_payload,
+        completed_at=completed_at,
+        incomplete_details=incomplete_details,
+        error=error,
+    )

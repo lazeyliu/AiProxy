@@ -8,6 +8,7 @@ from ..utils.logging import log_event
 from ..utils.token_count import count_messages_tokens, count_text_tokens
 from ..utils.responses_adapter import (
     build_output_message_item,
+    build_response_envelope,
     build_response_completed_payload,
     dump_output_item,
 )
@@ -149,25 +150,84 @@ def stream_responses_sse_from_chat(
 ):
     """Fallback: stream /v1/responses format using chat.completions."""
     try:
-        stream = stream_chat_completion(client, model, messages, **kwargs)
-        sequence_number = 0
+        sequence_number = -1
         message_states: dict[int, dict] = {}
         tool_states: dict[tuple[int, str], dict] = {}
         used_output_indices: set[int] = set()
         next_output_index = 0
-        created_event = {
-            "type": "response.created",
-            "response": {
-                "id": response_id,
-                "object": "response",
-                "created_at": created,
-                "model": response_model,
-                "status": "in_progress",
-                "output": [],
-            },
-        }
-        yield "event: response.created\n"
-        yield f"data: {json.dumps(created_event)}\n\n"
+        finish_reason = None
+        wants_logprobs = False
+
+        def payload_has_input_file(payload) -> bool:
+            if isinstance(payload, dict):
+                if payload.get("type") == "input_file":
+                    return True
+                return any(payload_has_input_file(value) for value in payload.values())
+            if isinstance(payload, list):
+                return any(payload_has_input_file(item) for item in payload)
+            return False
+
+        def detect_wants_logprobs(payload) -> bool:
+            if not isinstance(payload, dict):
+                return False
+            include = payload.get("include")
+            if isinstance(include, str):
+                include = [include]
+            if isinstance(include, list):
+                for item in include:
+                    if item == "message.output_text.logprobs":
+                        return True
+            if payload.get("logprobs"):
+                return True
+            if payload.get("top_logprobs") is not None:
+                return True
+            if payload_has_input_file(payload.get("input")) or payload_has_input_file(payload.get("messages")):
+                return True
+            return False
+
+        def emit(event_type: str, payload: dict):
+            nonlocal sequence_number
+            sequence_number += 1
+            data = dict(payload)
+            data["type"] = event_type
+            data["sequence_number"] = sequence_number
+            yield f"event: {event_type}\n"
+            yield f"data: {json.dumps(data)}\n\n"
+
+        def inject_logprobs(item: dict) -> dict:
+            if not wants_logprobs:
+                return item
+            if item.get("type") != "message":
+                return item
+            content = item.get("content")
+            if not isinstance(content, list):
+                return item
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "output_text" and "logprobs" not in part:
+                    part["logprobs"] = []
+            return item
+
+        wants_logprobs = detect_wants_logprobs(request_payload or {})
+        stream = stream_chat_completion(client, model, messages, **kwargs)
+
+        created_response = build_response_envelope(
+            response_id=response_id,
+            created=created,
+            model_id=response_model,
+            status="in_progress",
+            output_items=[],
+            usage_payload=None,
+            request_payload=request_payload,
+            completed_at=None,
+            error=None,
+            incomplete_details=None,
+        )
+        for evt in emit("response.created", {"response": created_response}):
+            yield evt
+        for evt in emit("response.in_progress", {"response": created_response}):
+            yield evt
 
         def alloc_output_index(preferred: int | None = None) -> int:
             nonlocal next_output_index
@@ -188,9 +248,13 @@ def stream_responses_sse_from_chat(
                 return state, []
             output_index = alloc_output_index(choice_index)
             item_id = f"msg_{response_id}_{choice_index}"
-            item_obj = build_output_message_item(
-                item_id=item_id, text="", status="in_progress"
-            )
+            item_obj = {
+                "id": item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            }
             state = {
                 "output_index": output_index,
                 "item_id": item_id,
@@ -198,25 +262,26 @@ def stream_responses_sse_from_chat(
                 "text": "",
             }
             message_states[choice_index] = state
-            added_event = {
-                "type": "response.output_item.added",
-                "response_id": response_id,
-                "output_index": output_index,
-                "item": dump_output_item(item_obj),
-            }
-            text_added_event = {
-                "type": "response.output_text.added",
-                "response_id": response_id,
-                "item_id": item_id,
-                "output_index": output_index,
-                "content_index": 0,
-                "text": "",
-            }
+            part = {"type": "output_text", "text": "", "annotations": []}
             events = [
-                f"event: response.output_item.added\n",
-                f"data: {json.dumps(added_event)}\n\n",
-                f"event: response.output_text.added\n",
-                f"data: {json.dumps(text_added_event)}\n\n",
+                (
+                    "response.output_item.added",
+                    {
+                        "response_id": response_id,
+                        "output_index": output_index,
+                        "item": dump_output_item(item_obj),
+                    },
+                ),
+                (
+                    "response.content_part.added",
+                    {
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": part,
+                    },
+                ),
             ]
             return state, events
 
@@ -230,6 +295,11 @@ def stream_responses_sse_from_chat(
                     choice_index = choice.get("index")
                 if not isinstance(choice_index, int):
                     choice_index = ordinal
+                chunk_finish = getattr(choice, "finish_reason", None)
+                if chunk_finish is None and isinstance(choice, dict):
+                    chunk_finish = choice.get("finish_reason")
+                if chunk_finish is not None:
+                    finish_reason = chunk_finish
                 delta_obj = getattr(choice, "delta", None)
                 delta = getattr(delta_obj, "content", None)
                 tool_calls = getattr(delta_obj, "tool_calls", None)
@@ -239,24 +309,24 @@ def stream_responses_sse_from_chat(
                         tool_calls = [{"index": 0, "function": function_call}]
                 if (isinstance(delta, str) and delta) or (isinstance(tool_calls, list) and tool_calls):
                     message_state, events = ensure_message_item(choice_index)
-                    for evt in events:
-                        yield evt
+                    for event_type, payload in events:
+                        for evt in emit(event_type, payload):
+                            yield evt
                 else:
                     message_state = message_states.get(choice_index)
                 if isinstance(delta, str) and delta and isinstance(message_state, dict):
                     message_state["text"] += delta
-                    delta_event = {
-                        "type": "response.output_text.delta",
-                        "response_id": response_id,
-                        "item_id": message_state["item_id"],
-                        "delta": delta,
-                        "output_index": message_state["output_index"],
-                        "content_index": 0,
-                        "sequence_number": sequence_number,
-                    }
-                    sequence_number += 1
-                    yield "event: response.output_text.delta\n"
-                    yield f"data: {json.dumps(delta_event)}\n\n"
+                    for evt in emit(
+                        "response.output_text.delta",
+                        {
+                            "response_id": response_id,
+                            "item_id": message_state["item_id"],
+                            "delta": delta,
+                            "output_index": message_state["output_index"],
+                            "content_index": 0,
+                        },
+                    ):
+                        yield evt
                 if isinstance(tool_calls, list):
                     for i, call in enumerate(tool_calls):
                         call_payload = _dump_delta(call)
@@ -283,34 +353,36 @@ def stream_responses_sse_from_chat(
                                 "arguments": "",
                             }
                             tool_states[tool_key] = state
-                            tool_added_event = {
-                                "type": "response.output_item.added",
-                                "response_id": response_id,
-                                "output_index": output_index,
-                                "item": {
-                                    "id": state["item_id"],
-                                    "type": "tool_call",
-                                    "status": "in_progress",
-                                    "call_id": call_id,
-                                    "name": state["name"],
-                                    "arguments": "",
+                            for evt in emit(
+                                "response.output_item.added",
+                                {
+                                    "response_id": response_id,
+                                    "output_index": output_index,
+                                    "item": {
+                                        "id": state["item_id"],
+                                        "type": "tool_call",
+                                        "status": "in_progress",
+                                        "call_id": call_id,
+                                        "name": state["name"],
+                                        "arguments": "",
+                                    },
                                 },
-                            }
-                            yield "event: response.output_item.added\n"
-                            yield f"data: {json.dumps(tool_added_event)}\n\n"
+                            ):
+                                yield evt
                         if name and not state["name"]:
                             state["name"] = name
                         if isinstance(args_delta, str) and args_delta:
                             state["arguments"] += args_delta
-                            args_event = {
-                                "type": "response.function_call_arguments.delta",
-                                "response_id": response_id,
-                                "item_id": state["item_id"],
-                                "output_index": state["output_index"],
-                                "delta": args_delta,
-                            }
-                            yield "event: response.function_call_arguments.delta\n"
-                            yield f"data: {json.dumps(args_event)}\n\n"
+                            for evt in emit(
+                                "response.function_call_arguments.delta",
+                                {
+                                    "response_id": response_id,
+                                    "item_id": state["item_id"],
+                                    "output_index": state["output_index"],
+                                    "delta": args_delta,
+                                },
+                            ):
+                                yield evt
 
         output_items = []
         output_texts = []
@@ -323,59 +395,76 @@ def stream_responses_sse_from_chat(
         for _, kind, state in sorted(final_items, key=lambda item: item[0]):
             if kind == "message":
                 output_texts.append(state["text"])
-                done_event = {
-                    "type": "response.output_text.done",
-                    "response_id": response_id,
-                    "item_id": state["item_id"],
-                    "text": state["text"],
-                    "output_index": state["output_index"],
-                    "content_index": 0,
-                    "sequence_number": sequence_number,
-                }
-                sequence_number += 1
-                yield "event: response.output_text.done\n"
-                yield f"data: {json.dumps(done_event)}\n\n"
+                for evt in emit(
+                    "response.output_text.done",
+                    {
+                        "response_id": response_id,
+                        "item_id": state["item_id"],
+                        "text": state["text"],
+                        "output_index": state["output_index"],
+                        "content_index": 0,
+                    },
+                ):
+                    yield evt
+                for evt in emit(
+                    "response.content_part.done",
+                    {
+                        "response_id": response_id,
+                        "item_id": state["item_id"],
+                        "output_index": state["output_index"],
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": state["text"], "annotations": []},
+                    },
+                ):
+                    yield evt
                 completed_item = build_output_message_item(
                     item_id=state["item_id"],
                     text=state["text"],
                     status="completed",
                 )
-                item_done_event = {
-                    "type": "response.output_item.done",
-                    "response_id": response_id,
-                    "output_index": state["output_index"],
-                    "item": dump_output_item(completed_item),
-                }
-                yield "event: response.output_item.done\n"
-                yield f"data: {json.dumps(item_done_event)}\n\n"
+                completed_item_payload = dump_output_item(completed_item)
+                completed_item_payload = inject_logprobs(completed_item_payload)
+                for evt in emit(
+                    "response.output_item.done",
+                    {
+                        "response_id": response_id,
+                        "output_index": state["output_index"],
+                        "item": completed_item_payload,
+                    },
+                ):
+                    yield evt
                 output_items.append(completed_item)
             else:
                 tool_args_texts.append(state["arguments"])
-                args_done_event = {
-                    "type": "response.function_call_arguments.done",
-                    "response_id": response_id,
-                    "item_id": state["item_id"],
-                    "output_index": state["output_index"],
+                for evt in emit(
+                    "response.function_call_arguments.done",
+                    {
+                        "response_id": response_id,
+                        "item_id": state["item_id"],
+                        "output_index": state["output_index"],
+                        "arguments": state["arguments"],
+                        "name": state["name"],
+                    },
+                ):
+                    yield evt
+                tool_done_event = {
+                    "id": state["item_id"],
+                    "type": "tool_call",
+                    "status": "completed",
+                    "call_id": state["call_id"],
+                    "name": state["name"],
                     "arguments": state["arguments"],
                 }
-                yield "event: response.function_call_arguments.done\n"
-                yield f"data: {json.dumps(args_done_event)}\n\n"
-                tool_done_event = {
-                    "type": "response.output_item.done",
-                    "response_id": response_id,
-                    "output_index": state["output_index"],
-                    "item": {
-                        "id": state["item_id"],
-                        "type": "tool_call",
-                        "status": "completed",
-                        "call_id": state["call_id"],
-                        "name": state["name"],
-                        "arguments": state["arguments"],
+                for evt in emit(
+                    "response.output_item.done",
+                    {
+                        "response_id": response_id,
+                        "output_index": state["output_index"],
+                        "item": tool_done_event,
                     },
-                }
-                yield "event: response.output_item.done\n"
-                yield f"data: {json.dumps(tool_done_event)}\n\n"
-                output_items.append(tool_done_event["item"])
+                ):
+                    yield evt
+                output_items.append(tool_done_event)
 
         if not output_items:
             output_items.append(
@@ -390,6 +479,15 @@ def stream_responses_sse_from_chat(
         for args in tool_args_texts:
             if args:
                 output_tokens += count_text_tokens(args, model=response_model)
+        def finish_reason_to_incomplete(reason: str | None) -> dict | None:
+            if reason == "length":
+                return {"reason": "max_tokens"}
+            if reason == "content_filter":
+                return {"reason": "content_filter"}
+            return None
+        incomplete_details = finish_reason_to_incomplete(finish_reason)
+        status = "incomplete" if incomplete_details else "completed"
+        completed_at = None if status != "completed" else int(time.time())
         response_dump = build_response_completed_payload(
             response_id=response_id,
             created=created,
@@ -399,31 +497,34 @@ def stream_responses_sse_from_chat(
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
             },
+            request_payload=request_payload,
+            status=status,
+            completed_at=completed_at,
+            incomplete_details=incomplete_details,
         )
-        completed_event = {
-            "type": "response.completed",
-            "response": response_dump,
-        }
-        yield "event: response.completed\n"
-        yield f"data: {json.dumps(completed_event)}\n\n"
+        final_event_type = "response.incomplete" if incomplete_details else "response.completed"
+        for evt in emit(final_event_type, {"response": response_dump}):
+            yield evt
     except openai.RateLimitError as e:
         _log_stream_error(e, request_id, upstream_url, request_payload)
         error_payload = {"type": "response.failed", "error": {"message": str(e), "type": "rate_limit_error"}}
-        yield "event: response.failed\n"
-        yield f"data: {json.dumps(error_payload)}\n\n"
+        for evt in emit("response.failed", {"error": error_payload["error"]}):
+            yield evt
     except openai.APIConnectionError as e:
         _log_stream_error(e, request_id, upstream_url, request_payload)
         error_payload = {"type": "response.failed", "error": {"message": str(e), "type": "api_connection_error"}}
-        yield "event: response.failed\n"
-        yield f"data: {json.dumps(error_payload)}\n\n"
+        for evt in emit("response.failed", {"error": error_payload["error"]}):
+            yield evt
     except openai.APIStatusError as e:
         _log_stream_error(e, request_id, upstream_url, request_payload)
         error_payload = {"type": "response.failed", "error": {"message": str(e), "type": "api_error"}}
-        yield "event: response.failed\n"
-        yield f"data: {json.dumps(error_payload)}\n\n"
+        for evt in emit("response.failed", {"error": error_payload["error"]}):
+            yield evt
     except Exception as e:
         _log_stream_error(e, request_id, upstream_url, request_payload)
         error_payload = {"type": "response.failed", "error": {"message": str(e), "type": "internal_error"}}
-        yield "event: response.failed\n"
-        yield f"data: {json.dumps(error_payload)}\n\n"
+        for evt in emit("response.failed", {"error": error_payload["error"]}):
+            yield evt
