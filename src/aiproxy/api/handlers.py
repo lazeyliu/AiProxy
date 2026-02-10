@@ -9,12 +9,19 @@ from flask import Response, jsonify, render_template, request, stream_with_conte
 from ..core.config import (
     get_config_errors,
     get_models_response,
+    get_responses_config,
     resolve_model_config,
 )
 from ..utils.http import error_response
 from ..utils.logging import log_event
+from ..utils.params import (
+    coerce_messages_for_chat,
+    extract_chat_params_from_responses,
+    normalize_messages_from_input,
+)
+from ..utils.responses_adapter import build_response_payload_from_chat
 from ..services.openai_service import create_client
-from .streaming import stream_openai_sse
+from .streaming import stream_openai_sse, stream_responses_sse_from_chat
 
 
 def _build_client(settings, base_url, api_key):
@@ -40,6 +47,39 @@ def _resolve_request_model(payload_dict):
     g.resolved_provider = resolved.get("provider_name") or resolved.get("base_url")
     g.resolved_provider_url = resolved.get("base_url")
     return resolved, None
+
+
+def _make_response_id(prefix: str) -> str:
+    return f"{prefix}-{int(time.time() * 1000)}"
+
+
+def _pick_responses_mode(resolved: dict) -> str:
+    responses_cfg = get_responses_config()
+    model_mode = (resolved.get("responses") or {}).get("mode")
+    provider_mode = (resolved.get("provider_responses") or {}).get("mode")
+    global_mode = responses_cfg.get("mode", "auto")
+    for mode in (model_mode, provider_mode):
+        if mode and mode != "auto":
+            return mode
+    base_url = (resolved.get("base_url") or "").lower()
+    if "openai.com" in base_url:
+        return global_mode if global_mode != "auto" else "native"
+    if global_mode == "native":
+        return "chat"
+    return global_mode if global_mode != "auto" else "chat"
+
+
+def _apply_instructions(messages, instructions):
+    if not instructions or not isinstance(instructions, str):
+        return messages
+    if not isinstance(messages, list):
+        return messages
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            return messages
+    return [{"role": "system", "content": instructions}] + messages
+
+
 
 
 def _build_upstream_url(base_url: str, endpoint: str) -> str:
@@ -255,14 +295,74 @@ def register_routes(app, settings):
                 return error_response(error_message, 400)
             payload = dict(data)
             payload["model"] = resolved["model"]
+            mode = _pick_responses_mode(resolved)
+            fallback_messages = normalize_messages_from_input(payload)
+            fallback_messages = _apply_instructions(
+                fallback_messages, payload.get("instructions") or payload.get("system")
+            )
+            fallback_messages = coerce_messages_for_chat(fallback_messages)
+            fallback_params = extract_chat_params_from_responses(payload)
+            if "max_tokens" not in fallback_params and "max_output_tokens" in payload:
+                fallback_params["max_tokens"] = payload.get("max_output_tokens")
+            if mode == "chat":
+                if not fallback_messages:
+                    return error_response("No input provided", 400, "invalid_request_error")
+                g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "chat/completions")
+                client = _build_client(settings, resolved["base_url"], resolved["api_key"])
+                if payload.get("stream"):
+                    response_id = _make_response_id("resp")
+                    created = int(time.time())
+                    return Response(
+                        stream_with_context(
+                            stream_responses_sse_from_chat(
+                                client,
+                                resolved["model"],
+                                fallback_messages,
+                                resolved["id"],
+                                response_id,
+                                created,
+                                request_id=g.request_id,
+                                upstream_url=g.upstream_url,
+                                **fallback_params,
+                            )
+                        ),
+                        mimetype='text/event-stream',
+                    )
+                response_obj = client.chat.completions.create(
+                    model=resolved["model"], messages=fallback_messages, **fallback_params
+                )
+                response_id = _make_response_id("resp")
+                created = int(time.time())
+                response_payload = build_response_payload_from_chat(
+                    response_obj,
+                    response_id=response_id,
+                    created=created,
+                    model_id=resolved["id"],
+                    model_name=resolved["model"],
+                    messages=fallback_messages,
+                )
+                return jsonify(response_payload)
             g.upstream_url = _build_upstream_url(resolved.get("base_url", ""), "responses")
             client = _build_client(settings, resolved["base_url"], resolved["api_key"])
             if payload.get("stream"):
                 if not hasattr(client.responses, "with_streaming_response") or not hasattr(client.responses, "with_raw_response"):
-                    stream = client.responses.create(**payload)
+                    if not fallback_messages:
+                        return error_response("No input provided", 400, "invalid_request_error")
+                    response_id = _make_response_id("resp")
+                    created = int(time.time())
                     return Response(
                         stream_with_context(
-                            stream_openai_sse(stream, request_id=g.request_id, upstream_url=g.upstream_url)
+                            stream_responses_sse_from_chat(
+                                client,
+                                resolved["model"],
+                                fallback_messages,
+                                resolved["id"],
+                                response_id,
+                                created,
+                                request_id=g.request_id,
+                                upstream_url=g.upstream_url,
+                                **fallback_params,
+                            )
                         ),
                         mimetype='text/event-stream',
                     )
@@ -274,8 +374,22 @@ def register_routes(app, settings):
                     mimetype='text/event-stream',
                 )
             if not hasattr(client.responses, "with_raw_response"):
-                response_obj = client.responses.create(**payload)
-                return jsonify(_model_dump(response_obj))
+                if not fallback_messages:
+                    return error_response("No input provided", 400, "invalid_request_error")
+                response_obj = client.chat.completions.create(
+                    model=resolved["model"], messages=fallback_messages, **fallback_params
+                )
+                response_id = _make_response_id("resp")
+                created = int(time.time())
+                response_payload = build_response_payload_from_chat(
+                    response_obj,
+                    response_id=response_id,
+                    created=created,
+                    model_id=resolved["id"],
+                    model_name=resolved["model"],
+                    messages=fallback_messages,
+                )
+                return jsonify(response_payload)
             response_obj = client.responses.with_raw_response.create(**payload)
             if hasattr(response_obj, "parse"):
                 return jsonify(_model_dump(response_obj.parse()))
