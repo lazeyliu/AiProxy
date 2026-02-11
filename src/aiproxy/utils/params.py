@@ -227,6 +227,9 @@ def coerce_messages_for_chat(messages):
         if not isinstance(msg, dict):
             normalized.append(msg)
             continue
+        if msg.get("role") == "developer":
+            msg = dict(msg)
+            msg["role"] = "system"
         content = msg.get("content")
         # Convert content dicts with explicit type into supported forms.
         if isinstance(content, dict):

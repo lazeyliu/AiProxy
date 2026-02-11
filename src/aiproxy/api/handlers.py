@@ -46,6 +46,7 @@ def _resolve_request_model(payload_dict):
     if allowed_models is not None and resolved.get("id") not in allowed_models:
         return None, "Model not allowed for this key"
     g.resolved_model = resolved.get("id")
+    g.resolved_target_model = resolved.get("model")
     g.resolved_provider = resolved.get("provider_name") or resolved.get("base_url")
     g.resolved_provider_url = resolved.get("base_url")
     return resolved, None
@@ -311,6 +312,7 @@ def register_routes(app, settings):
             payload = dict(data)
             payload["model"] = resolved["model"]
             mode = _pick_responses_mode(resolved)
+            g.responses_mode = mode
             has_input_file = request_has_input_file(payload)
             fallback_messages = normalize_messages_from_input(payload)
             fallback_messages = _apply_instructions(

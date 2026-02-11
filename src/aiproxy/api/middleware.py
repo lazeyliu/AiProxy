@@ -132,6 +132,8 @@ def register_middlewares(app, settings, rate_limiter):
             status=response.status_code,
             latency_ms=latency_ms,
             model=getattr(g, "resolved_model", None),
+            target_model=getattr(g, "resolved_target_model", None),
+            responses_mode=getattr(g, "responses_mode", None),
             provider=getattr(g, "resolved_provider", None),
             provider_url=getattr(g, "resolved_provider_url", None),
             upstream_url=getattr(g, "upstream_url", None),
